@@ -461,3 +461,61 @@ def test_weight_resolution_and_windows_torch_compat(tmp_path, monkeypatch):
     upscaled_level = utils.get_health_level(upscaled_bar, bar_color="red")
     assert upscaled_level is not None
     assert 0.15 < upscaled_level < 0.35
+
+
+def test_real_world_low_hp_minions_in_wave_with_low_bar_confidence_and_overlap():
+    """Verify low-HP minions (including melee/siege and low-confidence bars in overlapping waves) are detected."""
+    img = np.zeros((400, 400, 3), dtype=np.uint8)
+
+    # Realistic bordered & slightly blurred red health bar at ~12% HP (melee minion: 0.12 * 500 = 60 HP <= 77)
+    def make_realistic_red_bar(w: int, h: int, fill: int) -> np.ndarray:
+        bar = np.zeros((h, w, 3), dtype=np.uint8)
+        bar[:, :fill] = [55, 55, 185]
+        bar[:, fill:] = [28, 22, 32]
+        bar[0, :] = [15, 15, 15]
+        bar[-1, :] = [15, 15, 15]
+        bar[:, 0] = [15, 15, 15]
+        bar[:, -1] = [15, 15, 15]
+        return cv2.GaussianBlur(bar, (3, 1), 0.6)
+
+    # Minion A (melee, low HP: 6/50 = 12% -> 60 HP <= 77) at top
+    img[90:98, 100:150] = make_realistic_red_bar(50, 8, 6)
+    # Minion B (caster, low HP: 10/50 = 20% -> 60 HP <= 77) slightly lower, overlapped by Minion A's body box!
+    img[135:143, 100:150] = make_realistic_red_bar(50, 8, 10)
+
+    class WaveDetector:
+        def __call__(self, _frame):
+            return {
+                "red_minions": [
+                    # Minion A's body box extends down to y=165, overlapping BOTH Bar A (y=90..98) and Bar B (y=135..143)
+                    ((95, 85, 160, 165), "red melee minion", 0.84),
+                    ((95, 130, 160, 205), "red caster minion", 0.81),
+                ],
+                "red_health_bars": [
+                    # Low-HP bars often have confidence 0.30..0.55 in YOLOv9 (as seen in figures/futuristic.png)
+                    ((100, 90, 150, 98), 0.37),
+                    ((100, 135, 150, 143), 0.43),
+                ],
+                "blue_minions": [],
+                "blue_health_bars": [],
+                "cur_object_counts": {},
+            }
+
+    settings = LastHitSettings(
+        effective_damage=77.0,
+        max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+    )
+    candidates, visualized = process_frame(
+        captured_frame=CapturedFrame(image=img, captured_at=1.0),
+        detector=WaveDetector(),  # type: ignore[arg-type]
+        object_associator=ObjectAssociator(),
+        advisor=LastHitAdvisor(settings),
+        annotator=AIAnnotator(),
+        minion_color="red",
+    )
+
+    assert len(candidates) == 2
+    assert visualized is not None
+    # Closest to center (200, 200) is Minion B at y=130..205, then Minion A at y=85..165
+    assert candidates[0].minion.minion_type == "red caster minion"
+    assert candidates[1].minion.minion_type == "red melee minion"

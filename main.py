@@ -130,13 +130,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--health_margin",
         type=float,
-        default=0.02,
+        default=0.0,
         help="Safety margin added to measured health fraction (0 <= margin < 1).",
     )
     parser.add_argument(
         "--min_confidence",
         type=float,
-        default=0.6,
+        default=0.25,
         help="Minimum detector confidence for minions and health bars.",
     )
     parser.add_argument(

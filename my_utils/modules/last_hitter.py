@@ -33,8 +33,8 @@ class LastHitSettings:
     effective_damage: float
     # UPPER bounds on maximum health, updated as the game changes.
     max_health: Mapping[str, float]
-    health_margin: float = 0.02
-    min_confidence: float = 0.6
+    health_margin: float = 0.0
+    min_confidence: float = 0.25
     player_anchor: tuple[float, float] = (0.5, 0.5)
     max_distance: float | None = None
 

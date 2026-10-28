@@ -53,7 +53,7 @@ python main.py --list-monitors
 - `--H`, `--W`: Target frame height and width.
 - `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage.
 - `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`: Conservative upper bounds on minion maximum HP.
-- `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.02`).
-- `--min_confidence`: Minimum detection confidence for minions and health bars (default `0.6`).
+- `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.0`).
+- `--min_confidence`: Minimum detection confidence for minions and health bars (default `0.25`).
 - `--player_anchor`: Normalized `(x, y)` anchor in `[0, 1]` for distance prioritization (default `0.5 0.5`).
 - `--max_distance`: Optional maximum pixel distance from the player anchor.

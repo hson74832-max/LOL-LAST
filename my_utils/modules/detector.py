@@ -294,7 +294,7 @@ class Detector:
         dnn: bool = False,
         half: bool = False,
         imgsz: tuple[int, int] = (960, 960),
-        conf_thres: float = 0.25,
+        conf_thres: float = 0.15,
         iou_thres: float = 0.45,
         backend=None,
         auto_download: bool = True,
