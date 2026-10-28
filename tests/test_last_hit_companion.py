@@ -1359,3 +1359,182 @@ def test_check_devices_reports_backends_and_how_to_fix_them(monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "Inference backend diagnostics" in out
     assert "[INFO] torch : test-version" in out
+
+
+def test_debug_stats_and_hints_explain_every_empty_pipeline_stage():
+    from my_utils.modules.diagnostics import no_marker_hint, stats_from_frame
+
+    img = np.full((300, 400, 3), 60, dtype=np.uint8)
+    black = np.zeros((300, 400, 3), dtype=np.uint8)
+
+    def hint(det, pipeline=None, image=img, age=0.05, infer=0.04):
+        return no_marker_hint(
+            stats_from_frame(image, det, "red", pipeline=pipeline,
+                             detection_age_seconds=age, inference_seconds=infer)
+        )
+
+    # Nothing detected
+    assert "no minions and no health bars" in hint({"red_minions": [], "red_health_bars": []})
+    # Wrong minion colour
+    assert "--minion_color blue" in hint({"red_minions": [], "blue_minions": [1, 2]})
+    # Bodies without bars
+    assert "--min_bar_confidence" in hint({"red_minions": [1, 2, 3], "red_health_bars": []})
+    # No association
+    assert "none were matched" in hint(
+        {"red_minions": [1, 2], "red_health_bars": [1]}, {"matched": 0}
+    )
+    # Health filter rejects everything
+    assert "--effective_damage" in hint(
+        {"red_minions": [1], "red_health_bars": [1]},
+        {"matched": 1, "eligible": 0, "health": [0.85]},
+    )
+    # Confirmation gate hides an eligible candidate
+    assert "--confirm_frames" in hint(
+        {"red_minions": [1], "red_health_bars": [1]},
+        {"matched": 1, "eligible": 1, "kept": 0, "health": [0.1]},
+    )
+    # Stale boxes win over every other explanation (that is the actual cause)
+    stale = hint(
+        {"red_minions": [1], "red_health_bars": [1]},
+        {"matched": 0, "eligible": 0, "kept": 0, "stale": True},
+        age=0.62, infer=0.58,
+    )
+    assert "too old" in stale and "620ms" in stale and "--max_detection_age" in stale
+    # Black capture
+    assert "captured screen is black" in hint(
+        {"red_minions": [1], "red_health_bars": [1]},
+        {"matched": 1, "eligible": 1, "kept": 0},
+        image=black,
+    )
+    # Working case -> no hint at all
+    assert hint({"red_minions": [1], "red_health_bars": [1]},
+                {"matched": 1, "eligible": 1, "kept": 1, "health": [0.1]}) is None
+
+
+def test_debug_reporter_formats_prints_and_saves_annotated_frames(tmp_path, capsys):
+    from my_utils.modules.diagnostics import DebugReporter, annotate_debug_frame, format_stats
+
+    img = np.full((300, 400, 3), 60, dtype=np.uint8)
+    detection_result = {
+        "red_minions": [((100, 80, 140, 160), "red caster minion", 0.9)],
+        "red_health_bars": [((105, 85, 140, 93), 0.9)],
+    }
+    reporter = DebugReporter(minion_color="red", frames_dir=tmp_path / "dbg", interval=0.0)
+    stats = __import__("my_utils.modules.diagnostics", fromlist=["stats_from_frame"]).stats_from_frame(
+        img, detection_result, "red",
+        pipeline={"matched": 1, "eligible": 0, "kept": 0, "health": [0.55]},
+        detection_age_seconds=0.11, inference_seconds=0.09,
+    )
+    line = format_stats(stats, "red")
+    assert "bodies=1 bars=1" in line and "matched=1" in line
+    assert "infer=90ms" in line and "box_age=110ms" in line
+
+    hint = reporter.report(stats, force=True)
+    out = capsys.readouterr().out
+    assert "[DEBUG] brightness=60.0" in out
+    assert "--effective_damage" in out and hint
+
+    saved = reporter.save(img, detection_result, [], force=True)
+    assert saved is not None and saved.exists() and saved.name == "latest.png"
+    written = cv2.imread(str(saved))
+    assert written is not None and written.shape == img.shape
+    # Raw body and health-bar boxes are drawn even when nothing is last-hittable.
+    from my_utils.modules.diagnostics import BAR_BOX_COLOR, BODY_BOX_COLOR
+
+    assert tuple(written[80, 100]) == BODY_BOX_COLOR
+    assert tuple(written[85, 105]) == BAR_BOX_COLOR
+
+    # Without a directory nothing is written and no error is raised.
+    assert DebugReporter().save(img, detection_result, [], force=True) is None
+    with pytest.raises(ValueError):
+        annotate_debug_frame(None, detection_result, [])
+
+
+def test_main_debug_mode_reports_why_nothing_is_drawn(monkeypatch, capsys, tmp_path):
+    import main as main_module
+
+    img = np.full((300, 400, 3), 45, dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=30, color="red")
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, _frame):
+            return {
+                "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+                "red_health_bars": [((100, 90, 160, 98), 0.89)],
+                "blue_minions": [],
+                "blue_health_bars": [],
+                "cur_object_counts": {},
+            }
+
+    remaining = [CapturedFrame(image=img.copy(), captured_at=1.0 + i) for i in range(2)]
+
+    class FakeFrameLoader:
+        monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+        primary_monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def grab(self, window_rect=None):
+            if not remaining:
+                raise KeyboardInterrupt
+            return remaining.pop(0)
+
+    monkeypatch.setattr(main_module, "Detector", FakeDetector)
+    monkeypatch.setattr(main_module, "FrameLoader", FakeFrameLoader)
+
+    frames_dir = tmp_path / "debug-frames"
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(
+            [
+                "--sync", "--no-overlay", "--no-visualize", "--debug",
+                "--debug_interval", "0", "--debug_frames_dir", str(frames_dir),
+                # 50% HP on a caster (300 HP) = 150 HP > 80 damage -> not last-hittable
+            ]
+        )
+
+    out = capsys.readouterr().out
+    assert "Diagnostics enabled" in out
+    assert "[DEBUG] brightness=" in out
+    assert "matched=1" in out and "eligible=0" in out
+    assert "--effective_damage" in out
+    assert "Both the preview window and the overlay are disabled" in out
+    assert (frames_dir / "latest.png").exists()
+
+    # Debug output is opt-in: no [DEBUG] lines without the flag.
+    remaining.clear()
+    remaining.extend(CapturedFrame(image=img.copy(), captured_at=2.0 + i) for i in range(2))
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(["--sync", "--no-overlay", "--no-visualize"])
+    assert "[DEBUG]" not in capsys.readouterr().out
+
+
+def test_describe_thresholds_turns_damage_into_hp_percentages():
+    from my_utils.modules.diagnostics import describe_thresholds
+
+    settings = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+        health_margin=0.0,
+    )
+    lines = describe_thresholds(settings, "red")
+    report = "\n".join(lines)
+    assert "effective_damage=80" in report
+    assert "red caster        : only while the bar reads <= 27% HP" in report
+    assert "red melee         : only while the bar reads <= 16% HP" in report
+    assert "red siege         : only while the bar reads <= 5% HP" in report
+
+    weak = LastHitSettings(effective_damage=10.0, max_health={"caster": 300.0}, health_margin=0.1)
+    assert "never last-hittable" in "\n".join(describe_thresholds(weak))
+
+    huge = LastHitSettings(effective_damage=900.0, max_health={"caster": 300.0})
+    assert "any HP" in "\n".join(describe_thresholds(huge))

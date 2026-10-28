@@ -70,6 +70,36 @@ Check the first lines of console output, they state the device explicitly, e.g.:
 [INFO] Detector initialized on device=privateuseone:0 [DirectML] (fp16=False, imgsz=(640, 640))
 ```
 
+## "No markers at all" — start with `--debug`
+If nothing is drawn (neither on the game nor in the preview), run with diagnostics; every second it prints what each pipeline stage saw and *why* nothing was shown:
+
+```bat
+run.bat --debug --max_detection_age 1 --min_confidence 0.2 --min_bar_confidence 0.2 --confirm_frames 1
+```
+
+Example output:
+```
+[INFO] effective_damage=80 health_margin=0 min_confidence=0.2
+[INFO] red caster        : only while the bar reads <= 27% HP
+[INFO] red melee         : only while the bar reads <= 16% HP
+[INFO] red siege         : only while the bar reads <= 5% HP
+[DEBUG] brightness=63.4 | red bodies=7 bars=5 | other-color bodies=0 bars=0 | matched=4 hp=[62%, 11%] | eligible=1 drawn=1 | infer=95ms box_age=120ms
+```
+and, when empty, one line naming the fix, e.g.:
+```
+[DEBUG] no markers: detector boxes were too old, so markers were suppressed. infer=580ms, box_age=620ms. Speed up inference (install GPU support) or raise --max_detection_age (0 disables the limit).
+[DEBUG] no markers: 3 minion bodies detected but no health bars. Health bars score lower than bodies: lower --min_bar_confidence (try 0.15) or raise --imgsz 960 for small bars.
+[DEBUG] no markers: 2 bodies and 1 bar were detected but none were matched to each other ...
+[DEBUG] no markers: 1 minion read, but none is last-hittable with the current damage/HP model. Raise --effective_damage ...
+[DEBUG] no markers: 1 last-hittable minion found but hidden by the confirmation gate: lower --confirm_frames (1 disables it).
+[DEBUG] no markers: the captured screen is black. League of Legends must run in 'Borderless' or 'Windowed' mode ...
+[DEBUG] no markers: only blue minions were detected - you are looking for red ones. Try --minion_color blue.
+```
+
+`--debug` also writes an annotated `frames/debug/latest.png` (orange = detected minion bodies, magenta = detected health bars, coloured boxes = confirmed markers), so you can look at what the model actually saw. Related flags: `--debug_frames_dir`, `--debug_interval`.
+
+**Most common cause of "suddenly no markers":** a strict `--max_detection_age` (e.g. `0.2`) on a machine that is still running CPU inference (~300–600 ms per frame). Every box is then considered stale and suppressed — remove the flag or set `--max_detection_age 0` until `run.bat --check-devices` reports a GPU backend.
+
 ## Marker Strictness (no markers on dead minions)
 Confusing or delayed markers come from two places: **stale detections** (boxes from an older frame are projected onto the live frame) and **one-frame misreads** (a body/bar box for a minion that just died). Both are now throttled:
 
@@ -148,6 +178,8 @@ python main.py --list-monitors
 - `--max_detection_age`: Maximum age in seconds of detector boxes reused on a live frame (default `0.35`, `0` disables).
 - `--confirm_frames`: Consecutive detector results a candidate must be seen in before it is drawn (default `2`).
 - `--stale_frame_fallback`: Re-enable the legacy previous-frame fallback (off by default).
+- `--debug` / `--no-debug`: Per-frame diagnostics plus a one-line explanation of why no marker is drawn; writes `frames/debug/latest.png`.
+- `--debug_frames_dir`, `--debug_interval`: Where/how often the diagnostics write frames and lines.
 - `--player_anchor`: Normalized `(x, y)` anchor in `[0, 1]` for distance prioritization (default `0.5 0.5`).
 - `--max_distance`: Optional maximum pixel distance from the player anchor.
 - `--device`: `cpu`, `cuda:0` (NVIDIA), `mps` (Apple) or `directml` (AMD/Intel on Windows). Auto-detected when omitted.

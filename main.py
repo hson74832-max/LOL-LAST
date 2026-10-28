@@ -8,12 +8,14 @@ No game process memory access or mouse/keyboard input injection is performed.
 
 import argparse
 import threading
+import time
 import cv2
 import numpy as np
 
 from my_utils.loaders.frame_loader import CapturedFrame, FrameLoader
 from my_utils.modules.algorithms import ObjectAssociator
 from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector, diagnose_devices
+from my_utils.modules.diagnostics import DebugReporter, describe_thresholds, stats_from_frame
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.modules.stability import CandidateGate
 from my_utils.visualizers.annotator import AIAnnotator
@@ -43,6 +45,8 @@ class _AsyncDetectionWorker:
 
     def __init__(self, detector: Detector) -> None:
         self.detector = detector
+        self.last_inference_seconds: float | None = None
+        self.inference_count = 0
         self._lock = threading.Lock()
         self._event = threading.Event()
         self._pending_frame: CapturedFrame | None = None
@@ -82,9 +86,13 @@ class _AsyncDetectionWorker:
             if frame is None:
                 continue
 
+            started = time.perf_counter()
             detection_result = self.detector(frame.image)
+            elapsed = time.perf_counter() - started
             with self._lock:
                 self._latest = (frame, detection_result)
+                self.last_inference_seconds = elapsed
+                self.inference_count += 1
 
 
 def _parse_bool(value: str | bool) -> bool:
@@ -328,6 +336,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--debug",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_parse_bool,
+        help=(
+            "Print per-frame diagnostics (brightness, detected bodies/bars per color, "
+            "matched minions, HP readings, inference latency, box age) and explain why no "
+            "marker is drawn. Also saves an annotated frame to --debug_frames_dir."
+        ),
+    )
+    parser.add_argument(
+        "--no-debug",
+        dest="debug",
+        action="store_false",
+        help="Disable diagnostics output.",
+    )
+    parser.add_argument(
+        "--debug_frames_dir",
+        type=str,
+        default="frames/debug",
+        help="Where --debug writes the annotated 'latest.png' (default frames/debug).",
+    )
+    parser.add_argument(
+        "--debug_interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="Seconds between diagnostics lines / debug frame writes (default 1.0).",
+    )
+    parser.add_argument(
         "--check-devices",
         action="store_true",
         help=(
@@ -346,6 +384,7 @@ def process_frame(
     annotator: AIAnnotator | None = None,
     minion_color: str = "red",
     gate: CandidateGate | None = None,
+    pipeline_stats: dict | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Evaluate a single frame and return (prioritized_last_hit_candidates, visualized_frame)."""
     detection_result = detector(captured_frame.image)
@@ -356,10 +395,19 @@ def process_frame(
         excluded_regions=captured_frame.excluded_regions,
     )
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    if pipeline_stats is not None:
+        pipeline_stats.update(
+            matched=len(matched_minions),
+            eligible=len(candidates),
+            health=[m.health_level for m in matched_minions],
+            detection_result=detection_result,
+        )
     if gate is not None:
         candidates = gate.update(
             candidates, captured_frame.image.shape, generation=captured_frame
         )
+    if pipeline_stats is not None:
+        pipeline_stats["kept"] = len(candidates)
     visualized = (
         annotator(candidates=candidates, img=captured_frame.image)
         if annotator is not None
@@ -391,6 +439,7 @@ def evaluate_with_latest_detections(
     gate: CandidateGate | None = None,
     max_detection_age: float | None = DEFAULT_MAX_DETECTION_AGE,
     allow_stale_frame_fallback: bool = False,
+    pipeline_stats: dict | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Re-evaluate health bars on the live frame using the newest detector boxes.
 
@@ -406,6 +455,8 @@ def evaluate_with_latest_detections(
         )
         if gate is not None:
             gate.reset()
+        if pipeline_stats is not None:
+            pipeline_stats.update(matched=0, eligible=0, kept=0, health=[], stale=True)
         return [], visualized
 
     if latest_detection is None:
@@ -414,6 +465,9 @@ def evaluate_with_latest_detections(
     age = detection_age(captured_frame, latest_detection)
     # 0 (or None) disables the age limit, e.g. for very slow CPU-only machines.
     if max_detection_age and age is not None and age > max_detection_age:
+        if pipeline_stats is not None:
+            pipeline_stats["stale_age"] = age
+            pipeline_stats["stale"] = True
         return _empty()
 
     det_frame, detection_result = latest_detection
@@ -434,11 +488,21 @@ def evaluate_with_latest_detections(
         )
 
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    if pipeline_stats is not None:
+        pipeline_stats.update(
+            matched=len(matched_minions),
+            eligible=len(candidates),
+            health=[m.health_level for m in matched_minions],
+            stale=False,
+            detection_result=detection_result,
+        )
     if gate is not None:
         # Sightings are counted per detector result, not per capture frame.
         candidates = gate.update(
             candidates, captured_frame.image.shape, generation=det_frame
         )
+    if pipeline_stats is not None:
+        pipeline_stats["kept"] = len(candidates)
     # The live frame was just handed to the detection worker; annotating it in
     # place would let YOLOv9 read half-drawn boxes, so always render on a copy.
     visualized = (
@@ -527,6 +591,25 @@ def main(argv: list[str] | None = None) -> int:
         f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}."
     )
     annotator = AIAnnotator() if args.visualize else None
+    reporter = (
+        DebugReporter(
+            minion_color=args.minion_color,
+            frames_dir=args.debug_frames_dir,
+            interval=args.debug_interval,
+        )
+        if args.debug
+        else None
+    )
+    if reporter is not None:
+        print("[INFO] Diagnostics enabled (--debug).")
+        for line in describe_thresholds(settings, args.minion_color):
+            print(f"[INFO] {line}")
+        print(f"[INFO] Annotated frames are written to {reporter.frames_dir}/latest.png")
+        if not args.visualize and not args.overlay:
+            print(
+                "[NOTE] Both the preview window and the overlay are disabled, so no markers "
+                "can be displayed; --debug output is the only feedback."
+            )
 
     worker = None if args.sync else _AsyncDetectionWorker(detector)
     if worker is not None:
@@ -562,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     warned_black_frame = True
 
+                pipeline_stats: dict | None = {} if reporter is not None else None
                 if worker is not None:
                     worker.submit(captured)
                     latest = worker.get_latest()
@@ -572,12 +656,17 @@ def main(argv: list[str] | None = None) -> int:
                         and age > args.max_detection_age
                         and not warned_stale_detections
                     ):
+                        inference = worker.last_inference_seconds
                         print(
                             f"[WARNING] Detector boxes are {age * 1000:.0f} ms old, which is "
                             f"above --max_detection_age {args.max_detection_age * 1000:.0f} ms, "
-                            "so markers are suppressed instead of being drawn on stale boxes. "
-                            "Speed up inference (GPU: run.bat, AMD/Intel: "
-                            "install_requirements.bat --directml) or raise --max_detection_age."
+                            "so markers are suppressed instead of being drawn on stale boxes.\n"
+                            f"          Last inference took "
+                            f"{'n/a' if inference is None else f'{inference * 1000:.0f} ms'} "
+                            f"on device {detector.device_name}.\n"
+                            "          Either speed up inference (run.bat --check-devices shows "
+                            "whether the GPU is used) or raise --max_detection_age "
+                            "(0 disables the limit). --debug explains every frame."
                         )
                         warned_stale_detections = True
                     candidates, visualized = evaluate_with_latest_detections(
@@ -590,6 +679,7 @@ def main(argv: list[str] | None = None) -> int:
                         gate=gate,
                         max_detection_age=args.max_detection_age,
                         allow_stale_frame_fallback=args.stale_frame_fallback,
+                        pipeline_stats=pipeline_stats,
                     )
                 else:
                     candidates, visualized = process_frame(
@@ -600,6 +690,32 @@ def main(argv: list[str] | None = None) -> int:
                         annotator=annotator,
                         minion_color=args.minion_color,
                         gate=gate,
+                        pipeline_stats=pipeline_stats,
+                    )
+
+                if reporter is not None:
+                    detection_result = (pipeline_stats or {}).get("detection_result") or {}
+                    if worker is not None:
+                        age_seconds = detection_age(captured, latest)
+                        inference_seconds = worker.last_inference_seconds
+                    else:
+                        age_seconds = 0.0
+                        inference_seconds = None
+                    if pipeline_stats and pipeline_stats.get("stale_age") is not None:
+                        age_seconds = pipeline_stats["stale_age"]
+                    stats = stats_from_frame(
+                        image=captured.image,
+                        detection_result=detection_result,
+                        minion_color=args.minion_color,
+                        pipeline=pipeline_stats,
+                        detection_age_seconds=age_seconds,
+                        inference_seconds=inference_seconds,
+                    )
+                    reporter.report(stats)
+                    reporter.save(
+                        image=captured.image,
+                        detection_result=detection_result,
+                        candidates=candidates,
                     )
 
                 if not overlay_failed and overlay is None:
