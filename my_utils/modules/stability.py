@@ -6,6 +6,11 @@ survive the next frame, so a candidate is only shown after it has been seen
 ``confirm_frames`` times in a row.  A candidate that disappears is dropped
 immediately: holding a marker is exactly what makes the companion point at
 corpses.
+
+Minions that are only *approaching* last-hit range ("early"/orange candidates)
+are tracked the same way but do **not** go through the confirmation gate: they
+cannot be hit yet, so showing them a frame earlier is safe, and gating them would
+delay the orange marker that makes the yellow one appear on time.
 """
 
 from dataclasses import dataclass
@@ -63,6 +68,10 @@ class CandidateGate:
     def update(self, candidates, frame_shape=None, generation=None) -> list[LastHitCandidate]:
         """Return candidates that have been stable for ``confirm_frames`` sightings.
 
+        Candidates with ``killable=False`` (minions getting low, not killable yet)
+        are passed through unchanged: the gate only guards markers that claim a
+        minion can be last-hit right now.
+
         ``generation`` is any object identifying the detector result behind the
         candidates (compared by identity and kept referenced).  A live frame is
         re-evaluated many times per inference, so sightings are only counted when a
@@ -81,6 +90,11 @@ class CandidateGate:
             # Nothing seen this frame: every stale marker disappears immediately.
             self._tracks.clear()
             return []
+        passed_through = [c for c in candidates if not bool(getattr(c, "killable", True))]
+        candidates = [c for c in candidates if bool(getattr(c, "killable", True))]
+        if not candidates:
+            self._tracks.clear()
+            return passed_through
 
         measured = []
         for index, candidate in enumerate(candidates):
@@ -89,7 +103,7 @@ class CandidateGate:
                 measured.append((index, candidate, geometry))
         if not measured:
             self._tracks.clear()
-            return []
+            return passed_through
 
         # Greedy nearest-neighbour matching, closest pairs first, so two neighbouring
         # minions in a wave are never merged into one track.
@@ -128,4 +142,4 @@ class CandidateGate:
         # Tracks vanish with their candidate: no memory of minions that are already dead.
         self._tracks = new_tracks
         confirmed.sort(key=lambda item: item[0])
-        return [candidate for _, candidate in confirmed]
+        return [candidate for _, candidate in confirmed] + passed_through

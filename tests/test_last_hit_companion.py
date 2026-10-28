@@ -94,6 +94,8 @@ def test_only_last_hittable_minions_are_returned_and_prioritized():
         health_margin=0.02,
         min_confidence=0.6,
         player_anchor=(0.5, 0.5),
+        # Strict mode: no orange "approaching" stage, only killable minions.
+        early_marker_threshold=1.0,
     )
     advisor = LastHitAdvisor(settings)
     frame_shape = (1000, 1000, 3)
@@ -567,7 +569,8 @@ def test_async_detection_worker_and_live_frame_health_reevaluation():
         advisor = LastHitAdvisor(settings)
         annotator = AIAnnotator()
 
-        # On cap1 (50% HP = 150 HP > 77), minion is NOT last-hittable
+        # On cap1 (50% HP = 150 HP > 77) the minion cannot be last-hit yet, but it is
+        # already tracked: it gets the early (orange) marker, not a killable one.
         candidates_1, _ = evaluate_with_latest_detections(
             captured_frame=cap1,
             latest_detection=worker.get_latest(),
@@ -576,7 +579,9 @@ def test_async_detection_worker_and_live_frame_health_reevaluation():
             annotator=annotator,
             minion_color="red",
         )
-        assert candidates_1 == []
+        assert len(candidates_1) == 1
+        assert candidates_1[0].killable is False
+        assert candidates_1[0].health_upper_bound > 77.0
 
         # On cap2 (13% HP = 40 HP <= 77), using the already-available detection boxes on the live frame
         # immediately identifies the minion as last-hittable without waiting for another YOLO pass!
@@ -590,6 +595,7 @@ def test_async_detection_worker_and_live_frame_health_reevaluation():
             minion_color="red",
         )
         assert len(candidates_2) == 1
+        assert candidates_2[0].killable is True
         assert candidates_2[0].health_upper_bound <= 77.0
     finally:
         worker.stop()
@@ -778,13 +784,12 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
     events = []
 
     class FakeOverlay:
-        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0,
-                     show_labels=True, label_mode="hp", damage=None):
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0):
             self.closed = False
             events.append(("init", monitor["width"], primary_width, marker_gap))
 
-        def render(self, candidates, frame_shape, labels=None):
-            events.append(("render", len(candidates), tuple(frame_shape[:2]), len(labels or [])))
+        def render(self, candidates, frame_shape):
+            events.append(("render", len(candidates), tuple(frame_shape[:2])))
 
         def close(self):
             events.append(("close",))
@@ -797,7 +802,7 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
         main_module.main(["--sync", "--no-visualize", "--overlay_gap", "20"])
 
     assert events[0] == ("init", 400, 400, 20.0)
-    assert ("render", 1, (300, 400), 1) in events
+    assert ("render", 1, (300, 400)) in events
     assert events[-1] == ("close",)
 
     # --no-overlay keeps the desktop clean.
@@ -1065,13 +1070,10 @@ def test_main_gates_markers_and_honours_confirm_frames(monkeypatch):
     rendered = []
 
     class FakeOverlay:
-        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0,
-                     show_labels=True, label_mode="hp", damage=None):
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0):
             self.closed = False
-            assert label_mode in {"hp", "hp_damage", "percent"}
-            assert damage is None or damage > 0
 
-        def render(self, candidates, frame_shape, labels=None):
+        def render(self, candidates, frame_shape):
             rendered.append(len(candidates))
 
         def close(self):
@@ -1523,7 +1525,9 @@ def test_main_debug_mode_reports_why_nothing_is_drawn(monkeypatch, capsys, tmp_p
             [
                 "--sync", "--no-overlay", "--no-visualize", "--debug",
                 "--debug_interval", "0", "--debug_frames_dir", str(frames_dir),
-                # 50% HP on a caster (300 HP) = 150 HP > 80 damage -> not last-hittable
+                # 50% HP on a caster (300 HP) = 150 HP > 80 damage -> not last-hittable,
+                # and early_marker_threshold 1 disables the orange stage.
+                "--early_marker_threshold", "1",
             ]
         )
 
@@ -1554,9 +1558,21 @@ def test_describe_thresholds_turns_damage_into_hp_percentages():
     lines = describe_thresholds(settings, "red")
     report = "\n".join(lines)
     assert "effective_damage=80" in report
-    assert "red caster        : only while the bar reads <= 27% HP" in report
-    assert "red melee         : only while the bar reads <= 16% HP" in report
-    assert "red siege         : only while the bar reads <= 5% HP" in report
+    assert "early_marker_threshold=2x" in report
+    # Orange while the bar is within 2x damage, yellow once it is within 1x damage.
+    assert "red caster        : orange while the bar reads <= 53% HP, yellow while the bar reads <= 27% HP" in report
+    assert "red melee         : orange while the bar reads <= 32% HP, yellow while the bar reads <= 16% HP" in report
+    assert "red siege         : orange while the bar reads <= 11% HP, yellow while the bar reads <= 5% HP" in report
+
+    strict = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0},
+        health_margin=0.0,
+        early_marker_threshold=1.0,
+    )
+    assert "orange while the bar reads <= 27% HP, yellow while the bar reads <= 27% HP" in "\n".join(
+        describe_thresholds(strict, "red")
+    )
 
     weak = LastHitSettings(effective_damage=10.0, max_health={"caster": 300.0}, health_margin=0.1)
     assert "never last-hittable" in "\n".join(describe_thresholds(weak))
@@ -1666,7 +1682,11 @@ def test_wave_without_yolo_bars_still_produces_last_hit_candidates():
     )
     ranked = LastHitAdvisor(settings).rank(matched, img.shape)
     assert ranked, "geometric bar reading must make low-HP minions actionable"
-    assert all(c.health_upper_bound <= 80.0 for c in ranked)
+    killable = [c for c in ranked if c.killable]
+    assert killable, "the low-HP minions must be killable"
+    assert all(c.health_upper_bound <= 80.0 for c in killable)
+    # Killable minions are ranked before the ones that are only approaching.
+    assert [c.killable for c in ranked] == sorted((c.killable for c in ranked), reverse=True)
 
     # ... and --no-bar_locator restores the old (broken) behaviour.
     legacy = ObjectAssociator(fallback_to_locator=False)
@@ -1973,11 +1993,13 @@ def test_main_loop_respects_max_fps(monkeypatch):
     assert elapsed >= 0.2, elapsed
 
 
-def _candidate(x, y, hp=40.0, kind="red caster minion", health=0.13, held=False):
+def _candidate(x, y, hp=40.0, kind="red caster minion", health=0.13, held=False,
+               killable=True):
     return LastHitCandidate(
         minion=Minion(kind, health, (x, y, x + 40, y + 60), 0.9),
         health_upper_bound=hp,
         distance=1.0,
+        killable=killable,
         held=held,
     )
 
@@ -2040,7 +2062,31 @@ def test_minion_tracker_keeps_neighbours_apart():
     assert held[0].health_upper_bound == pytest.approx(30)
 
 
-def test_overlay_draws_hp_labels_and_dashes_held_markers():
+def test_overlay_colours_markers_orange_then_yellow_then_held():
+    """Orange = getting low, yellow/green = killable now, dimmed = kept marker."""
+    from my_utils.visualizers.overlay import (
+        EARLY_PRIMARY_COLOR,
+        EARLY_SECONDARY_COLOR,
+        HELD_PRIMARY_COLOR,
+        HELD_EARLY_PRIMARY_COLOR,
+        PRIMARY_TARGET_COLOR,
+        SECONDARY_TARGET_COLOR,
+        marker_color,
+    )
+
+    assert marker_color(1, killable=False) == EARLY_PRIMARY_COLOR
+    assert marker_color(2, killable=False) == EARLY_SECONDARY_COLOR
+    assert marker_color(1, killable=True) == PRIMARY_TARGET_COLOR
+    assert marker_color(3, killable=True) == SECONDARY_TARGET_COLOR
+    # Kept (held) markers are dimmed versions of the same state.
+    assert marker_color(1, killable=True, held=True) == HELD_PRIMARY_COLOR
+    assert marker_color(1, killable=False, held=True) == HELD_EARLY_PRIMARY_COLOR
+    colours = {EARLY_PRIMARY_COLOR, EARLY_SECONDARY_COLOR, PRIMARY_TARGET_COLOR,
+               SECONDARY_TARGET_COLOR, HELD_PRIMARY_COLOR, HELD_EARLY_PRIMARY_COLOR}
+    assert len(colours) == 6, "every marker state must be distinguishable"
+
+
+def test_overlay_draws_no_text_and_dashes_kept_markers():
     from my_utils.visualizers.overlay import DesktopOverlay
 
     class _Canvas:
@@ -2061,9 +2107,6 @@ def test_overlay_draws_hp_labels_and_dashes_held_markers():
     overlay.monitor_left = overlay.monitor_top = 0
     overlay.monitor_width, overlay.monitor_height = 1920, 1080
     overlay.marker_gap = 16.0
-    overlay.show_labels = True
-    overlay.label_font = ("Segoe UI", 9, "bold")
-    overlay.label_offset = 6.0
     overlay._display_scale = 1.0
     overlay._max_interval = 0.0
     overlay._last_render = 0.0
@@ -2073,23 +2116,17 @@ def test_overlay_draws_hp_labels_and_dashes_held_markers():
     overlay._canvas = _Canvas()
 
     live = _candidate(960, 500, hp=57)
+    early = _candidate(200, 500, hp=120, health=0.4, killable=False)
     held = _candidate(480, 500, hp=33, held=True)
-    overlay.render([live, held], (1080, 1920, 3))
+    overlay.render([live, early, held], (1080, 1920, 3))
 
-    labels = [kwargs["text"] for _, kwargs in overlay._canvas.texts]
-    assert labels == ["57 HP", "33 HP?"]          # '?' marks an expired reading
-    polygons = [kwargs for _, kwargs in overlay._canvas.polygons]
-    assert polygons[0]["dash"] == ()
-    assert polygons[1]["dash"] == (2, 2)
-    from my_utils.visualizers.overlay import HELD_SECONDARY_COLOR
-
-    assert polygons[1]["fill"] == HELD_SECONDARY_COLOR
-
-    # Labels can be switched off entirely.
-    overlay.show_labels = False
-    overlay._max_interval = 0.0
-    overlay.render([live], (1080, 1920, 3))
+    # The indicator is a marker only: there is no number above the head any more.
     assert overlay._canvas.texts == []
+    polygons = [kwargs for _, kwargs in overlay._canvas.polygons]
+    assert len(polygons) == 3
+    assert polygons[0]["dash"] == ()
+    assert polygons[1]["dash"] == ()
+    assert polygons[2]["dash"] == (2, 2)          # held marker is dashed
 
 
 def test_annotator_marks_held_candidates(capsys=None):
@@ -2102,18 +2139,40 @@ def test_annotator_marks_held_candidates(capsys=None):
     assert not np.array_equal(rendered, frame)
 
 
-def test_cli_exposes_hold_and_label_flags():
+def test_cli_exposes_hold_and_early_marker_flags():
     parser = build_arg_parser()
     defaults = parser.parse_args([])
-    assert defaults.hold_ms == 250.0
-    assert defaults.overlay_labels is True
 
-    tuned = parser.parse_args(["--hold_ms", "400", "--no-overlay_labels"])
-    assert tuned.hold_ms == 400.0
-    assert tuned.overlay_labels is False
-    assert parser.parse_args(["--overlay_labels", "False"]).overlay_labels is False
+    # Markers are kept until the minion dies, and the orange stage is on by default.
+    assert defaults.hold_ms == 5000.0
+    assert defaults.early_marker_threshold == 2.0
+    assert defaults.kill_health_percent == 3.0
+
+    tuned = parser.parse_args(
+        ["--hold_ms", "8000", "--early_marker_threshold", "3", "--kill_health_percent", "5"]
+    )
+    assert tuned.hold_ms == 8000.0
+    assert tuned.early_marker_threshold == 3.0
+    assert tuned.kill_health_percent == 5.0
+
+    # The removed HP-number flags must be gone.
+    for flag in ("--overlay_labels", "--overlay_label_mode", "--hp_labels",
+                 "--hp_label_below", "--hp_hold_ms", "--champion", "--item",
+                 "--damage_table", "--level", "--minion_armor"):
+        assert flag not in parser.format_help()
+
     with pytest.raises(SystemExit):
         parser.parse_args(["--hold_ms", "-5"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--early_marker_threshold", "0.5"])
+    # 0 disables the "this minion was killed" shortcut; the range is checked in main().
+    assert parser.parse_args(["--kill_health_percent", "0"]).kill_health_percent == 0.0
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--kill_health_percent", "-1"])
+    import main as main_module
+
+    with pytest.raises(SystemExit):
+        main_module.main(["--kill_health_percent", "150"])
 
 
 def test_hold_survives_a_dropped_detection_in_the_pipeline():
@@ -2178,208 +2237,128 @@ def test_hold_survives_a_dropped_detection_in_the_pipeline():
     assert gone == []
 
 
-def test_overlay_label_modes_show_hp_damage_margin():
-    from my_utils.visualizers.overlay import DesktopOverlay
 
-    class _Canvas:
-        def __init__(self):
-            self.texts = []
 
-        def delete(self, *_a):
-            self.texts.clear()
+def test_early_markers_track_minions_two_hits_before_they_are_killable():
+    """The first marker is orange, with the wider 2x damage threshold."""
+    settings = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+    )
+    assert settings.early_marker_threshold == 2.0
+    advisor = LastHitAdvisor(settings)
+    shape = (1000, 1000, 3)
 
-        def create_polygon(self, *a, **k):
-            pass
+    killable_now = Minion("red caster minion", 0.20, (480, 480, 520, 520), 0.9)   # 60 HP
+    two_hits_away = Minion("red caster minion", 0.45, (100, 100, 140, 140), 0.9)  # 135 HP
+    too_healthy = Minion("red caster minion", 0.70, (900, 900, 940, 940), 0.9)    # 210 HP
 
-        def create_text(self, *a, **k):
-            self.texts.append(k["text"])
+    ranked = advisor.rank([too_healthy, two_hits_away, killable_now], shape)
+    assert [c.minion for c in ranked] == [killable_now, two_hits_away]
+    # The killable minion is first (it can be hit now) and is yellow;
+    # the approaching one is orange until the bar drops far enough.
+    assert [c.killable for c in ranked] == [True, False]
+    assert ranked[0].health_upper_bound <= settings.effective_damage
+    assert ranked[1].health_upper_bound == pytest.approx(135.0)
+    assert ranked[1].health_upper_bound > settings.effective_damage
 
-    def make(mode, damage=None):
-        overlay = DesktopOverlay.__new__(DesktopOverlay)
-        overlay.monitor_left = overlay.monitor_top = 0
-        overlay.monitor_width, overlay.monitor_height = 1920, 1080
-        overlay.marker_gap = 16.0
-        overlay.show_labels = True
-        overlay.label_font = ("Segoe UI", 9, "bold")
-        overlay.label_offset = 6.0
-        overlay.label_mode = mode
-        overlay.damage = damage
-        overlay._display_scale = 1.0
-        overlay._max_interval = 0.0
-        overlay._last_render = 0.0
-        overlay._closed = False
-        overlay._tkinter = None
-        overlay._root = type("R", (), {"update": lambda self: None})()
-        overlay._canvas = _Canvas()
-        return overlay
-
-    candidate = _candidate(960, 500, hp=58, health=0.193)
-    overlay = make("hp")
-    overlay.render([candidate], (1080, 1920, 3))
-    assert overlay._canvas.texts == ["58 HP"]
-
-    overlay = make("hp_damage", damage=80.0)
-    overlay.render([candidate], (1080, 1920, 3))
-    assert overlay._canvas.texts == ["58/80"]      # 22 HP of margin left
-
-    overlay = make("percent")
-    overlay.render([candidate], (1080, 1920, 3))
-    assert overlay._canvas.texts == ["19%"]
+    # A wider threshold marks minions even earlier; 1 disables the orange stage.
+    wider = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0},
+        early_marker_threshold=3.0,
+    )
+    assert len(LastHitAdvisor(wider).rank([too_healthy], shape)) == 1
+    strict = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0},
+        early_marker_threshold=1.0,
+    )
+    assert LastHitAdvisor(strict).rank([two_hits_away], shape) == []
+    assert LastHitAdvisor(strict).rank([killable_now], shape)[0].killable is True
 
     with pytest.raises(ValueError):
-        DesktopOverlay(
-            {"left": 0, "top": 0, "width": 100, "height": 100}, label_mode="nonsense"
-        )
-
-    parser = build_arg_parser()
-    assert parser.parse_args([]).overlay_label_mode == "hp"
-    assert parser.parse_args(["--overlay_label_mode", "hp_damage"]).overlay_label_mode == "hp_damage"
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--overlay_label_mode", "bogus"])
+        LastHitSettings(effective_damage=80.0, max_health={"caster": 300.0},
+                        early_marker_threshold=0.9)
 
 
-def _hp_minion(hp, kind="red caster minion", x=100, y=200, confidence=0.9):
-    return Minion(kind, hp, (x, y, x + 40, y + 60), confidence)
+def test_early_candidates_skip_the_confirmation_gate_but_killable_ones_do_not():
+    from my_utils.modules.stability import CandidateGate
+
+    gate = CandidateGate(confirm_frames=2)
+    generation = object()
+    early = _candidate(100, 100, hp=140, health=0.45, killable=False)
+    killable = _candidate(400, 100, hp=40)
+
+    # A minion that is only approaching is drawn immediately: nothing can be
+    # mis-clicked, and waiting would delay the orange marker.
+    out = gate.update([early], (300, 800, 3), generation=generation)
+    assert out == [early]
+
+    # A killable marker still needs its consecutive sightings.
+    assert gate.update([killable], (300, 800, 3), generation=generation) == []
+    out = gate.update([killable], (300, 800, 3), generation=object())
+    assert [c.killable for c in out] == [True]
+
+    # Both kinds are reported together, killable first.
+    out = gate.update([early, killable], (300, 800, 3), generation=object())
+    assert [c.killable for c in out] == [True, False]
 
 
-def test_hp_labels_start_at_the_threshold_and_stay_until_the_minion_dies():
-    """The number appears before the minion is killable and survives bar flicker."""
-    from my_utils.modules.hp_labels import HpLabelTracker
+def test_marker_stays_while_the_minion_is_low_and_goes_when_it_dies():
+    from my_utils.modules.tracking import MinionTracker
 
-    max_hp = {"caster": 300.0, "melee": 500.0, "siege": 1500.0}
-    with pytest.raises(ValueError):
-        HpLabelTracker(max_health={})
-    with pytest.raises(ValueError):
-        HpLabelTracker(max_health={"purple": 100.0})
-    with pytest.raises(ValueError):
-        HpLabelTracker(max_health=max_hp, threshold_percent=0)
-    with pytest.raises(ValueError):
-        HpLabelTracker(max_health=max_hp, threshold_percent=101)
-    with pytest.raises(ValueError):
-        HpLabelTracker(max_health=max_hp, hold_ms=-1)
+    tracker = MinionTracker(hold_ms=5000, kill_health_percent=3.0)
+    shape = (300, 800, 3)
+    low = _candidate(100, 100, hp=40, health=0.13)
 
-    tracker = HpLabelTracker(max_health=max_hp, threshold_percent=50.0, hold_ms=1000.0)
+    # Orange marker first (not killable yet) -> then it turns yellow.
+    tracker.update([_candidate(100, 100, hp=150, health=0.45, killable=False)], shape, now=0.0)
+    out = tracker.update([low], shape, now=0.2)
+    assert len(out) == 1 and out[0].killable is True and out[0].held is False
 
-    # A healthy minion shows no number: the overlay stays readable.
-    assert tracker.update([_hp_minion(0.60)], now=0.0) == []
+    # The minion is not detected for a while (bar unreadable, death animation,
+    # camera pan): the marker is KEPT with its last position/reading.
+    for age in (0.5, 1.5, 3.9):
+        out = tracker.update([], shape, now=age)
+        assert len(out) == 1 and out[0].held is True
+        assert out[0].minion.bbox == low.minion.bbox
+        assert out[0].health_upper_bound == pytest.approx(40)
 
-    # Below the threshold the number appears immediately - long before the minion
-    # is last-hittable - and it is a conservative (upper-bound) HP value.
-    labels = tracker.update([_hp_minion(0.45)], now=0.1)
-    assert len(labels) == 1
-    assert labels[0].health_upper_bound == pytest.approx(135.0)
-    assert labels[0].health_percent == pytest.approx(45.0)
-    assert labels[0].held is False
+    # Finally it comes back: the marker is live again, not a leftover.
+    out = tracker.update([low], shape, now=4.1)
+    assert out[0].held is False
 
-    # One flickering bar reading above the threshold must not hide the number.
-    labels = tracker.update([_hp_minion(0.55)], now=0.2)
-    assert len(labels) == 1 and labels[0].held is False
 
-    # Minion stops being detected: the number is held and flagged as stale.
-    held = tracker.update([], now=0.6)
-    assert len(held) == 1 and held[0].held is True
-    assert held[0].health_upper_bound == pytest.approx(165.0)
+def test_killed_minions_lose_their_marker_immediately():
+    """The marker must not linger on a minion that was just killed."""
+    from my_utils.modules.tracking import MinionTracker
 
-    # ... and disappears after the grace period, i.e. when the minion is dead.
-    assert tracker.update([], now=2.0) == []
+    tracker = MinionTracker(hold_ms=5000, kill_health_percent=3.0)
+    shape = (300, 800, 3)
+
+    # Last reading 1 % HP -> the next frame without it means it died.
+    dying = _candidate(100, 100, hp=3, health=0.01)
+    tracker.update([dying], shape, now=0.0)
+    assert tracker.update([], shape, now=0.1) == []
     assert tracker.track_count == 0
 
-
-def test_hp_labels_ignore_unusable_readings_and_neighbouring_minions_stay_separate():
-    from my_utils.modules.hp_labels import HpLabelTracker
-
-    tracker = HpLabelTracker(max_health={"caster": 300.0, "melee": 500.0}, threshold_percent=50.0)
-    assert tracker.update([Minion("purple caster minion", 0.3, (0, 0, 40, 60), 0.9)]) == []
-    assert tracker.update([Minion("red siege minion", 0.3, (0, 0, 40, 60), 0.9)]) == []
-    assert tracker.update([_hp_minion(0.3, confidence=0.05)]) == []
-    assert tracker.update([Minion("red caster minion", 0.0, (0, 0, 40, 60), 0.9)]) == []
-
-    left = _hp_minion(0.30, x=100, y=200)
-    right = _hp_minion(0.20, x=160, y=200)   # overlapping wave, 60 px away
-    labels = tracker.update([left, right], now=0.0)
-    assert len(labels) == 2
-    assert labels[0].health_upper_bound == pytest.approx(90.0)
-    assert labels[1].health_upper_bound == pytest.approx(60.0)
+    # A minion that leaves view at 30 % HP is NOT assumed dead: its marker is kept
+    # for the grace period and only then dropped.
+    leaving = _candidate(400, 100, hp=90, health=0.30)
+    tracker.update([leaving], shape, now=1.0)
+    assert len(tracker.update([], shape, now=1.2)) == 1
+    assert tracker.update([], shape, now=7.0) == []
 
 
-def test_overlay_draws_one_number_per_minion_and_never_duplicates_targets():
-    from my_utils.modules.hp_labels import HpLabel
-    from my_utils.visualizers.overlay import DesktopOverlay
-
-    class _Canvas:
-        def __init__(self):
-            self.texts = []
-            self.polygons = []
-
-        def delete(self, *_a):
-            self.texts.clear()
-            self.polygons.clear()
-
-        def create_polygon(self, *a, **k):
-            self.polygons.append(k)
-
-        def create_text(self, *a, **k):
-            self.texts.append(k["text"])
-
-    overlay = DesktopOverlay.__new__(DesktopOverlay)
-    overlay.monitor_left = overlay.monitor_top = 0
-    overlay.monitor_width, overlay.monitor_height = 1920, 1080
-    overlay.marker_gap = 16.0
-    overlay.show_labels = True
-    overlay.label_font = ("Segoe UI", 9, "bold")
-    overlay.label_offset = 6.0
-    overlay.label_mode = "hp"
-    overlay.damage = None
-    overlay._display_scale = 1.0
-    overlay._max_interval = 0.0
-    overlay._last_render = 0.0
-    overlay._closed = False
-    overlay._tkinter = None
-    overlay._root = type("R", (), {"update": lambda self: None})()
-    overlay._canvas = _Canvas()
-
-    target = _candidate(960, 500, hp=58, health=0.193)
-    same_minion = HpLabel(minion=target.minion, health_upper_bound=58.0)
-    other = HpLabel(
-        minion=Minion("red melee minion", 0.40, (480, 500, 520, 560), 0.9),
-        health_upper_bound=200.0,
-    )
-
-    overlay.render([target], (1080, 1920, 3), labels=[same_minion, other])
-    # The target's own marker label, plus the unrelated minion's number - never twice.
-    assert overlay._canvas.texts == ["58 HP", "200 HP"]
-    assert len(overlay._canvas.polygons) == 1
-
-    # Held numbers are marked with '?' so a stale reading is obvious.
-    overlay.render([], (1080, 1920, 3), labels=[HpLabel(other.minion, 200.0, held=True)])
-    assert overlay._canvas.texts == ["200 HP?"]
-
-    # --no-overlay_labels silences the whole label layer.
-    overlay.show_labels = False
-    overlay.render([target], (1080, 1920, 3), labels=[other])
-    assert overlay._canvas.texts == []
-
-
-def test_annotator_draws_hp_numbers_for_minions_that_are_not_targets():
-    from my_utils.modules.hp_labels import HpLabel
+def test_process_frame_shows_orange_then_yellow_and_keeps_the_marker(capsys=None):
+    """End-to-end: one marker per minion, orange first, yellow when killable."""
+    from my_utils.modules.stability import CandidateGate
+    from my_utils.modules.tracking import MinionTracker
 
     img = np.zeros((400, 400, 3), dtype=np.uint8)
-    annotator = AIAnnotator()
-    label = HpLabel(
-        minion=Minion("red caster minion", 0.20, (170, 175, 235, 240), 0.9),
-        health_upper_bound=60.0,
-    )
-    rendered = annotator(candidates=[], img=img, labels=[label])
-    assert rendered.sum() > 0, "the number must be visible in the preview window"
-    assert annotator(candidates=[], img=img, labels=[]).sum() == 0
-
-
-def test_process_frame_labels_minions_that_are_not_last_hittable_yet():
-    """A half-dead minion too tanky to kill still gets its number above its head."""
-    from my_utils.modules.hp_labels import HpLabelTracker
-
-    img = np.zeros((400, 400, 3), dtype=np.uint8)
-    img[180:188, 170:230] = make_synthetic_health_bar(width=60, height=8, fill_px=18, color="red")
+    # ~45 % of a caster bar: 135 HP > 80 damage -> orange only
+    img[180:188, 170:230] = make_synthetic_health_bar(width=60, height=8, fill_px=27, color="red")
 
     class DummyDetector:
         def __call__(self, _frame):
@@ -2391,217 +2370,57 @@ def test_process_frame_labels_minions_that_are_not_last_hittable_yet():
             }
 
     settings = LastHitSettings(
-        effective_damage=20.0,       # far below the minion's HP: nothing is killable
+        effective_damage=80.0,
         max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
     )
-    tracker = HpLabelTracker(max_health=settings.max_health, threshold_percent=50.0)
-    pipeline_stats = {}
-    candidates, visualized = process_frame(
+    tracker = MinionTracker(hold_ms=5000)
+    gate = CandidateGate(confirm_frames=2)
+    stats = {}
+
+    orange, visualized = process_frame(
         captured_frame=CapturedFrame(image=img, captured_at=1.0),
         detector=DummyDetector(),  # type: ignore[arg-type]
         object_associator=ObjectAssociator(),
         advisor=LastHitAdvisor(settings),
         annotator=AIAnnotator(),
         minion_color="red",
-        pipeline_stats=pipeline_stats,
-        hp_tracker=tracker,
+        gate=gate,
+        pipeline_stats=stats,
+        tracker=tracker,
+    )
+    assert len(orange) == 1 and orange[0].killable is False
+    assert stats["early"] == 1 and stats["kept"] == 1
+
+    # The marker is orange in the preview window.
+    from my_utils.visualizers.annotator import EARLY_PRIMARY_COLOR
+
+    assert tuple(visualized[175, 200]) == EARLY_PRIMARY_COLOR
+
+
+def test_annotator_colours_early_candidates_orange():
+    from my_utils.visualizers.annotator import (
+        EARLY_PRIMARY_COLOR,
+        EARLY_SECONDARY_COLOR,
+        PRIMARY_TARGET_COLOR,
+        SECONDARY_TARGET_COLOR,
     )
 
-    assert candidates == [], "the minion is not last-hittable with 20 damage"
-    assert pipeline_stats["hp_labels"] == 1
-    assert len(tracker.last_labels) == 1
-    assert tracker.last_labels[0].health_percent <= 50.0
-    assert visualized is not None and visualized.sum() > 0
+    frame = np.zeros((400, 400, 3), dtype=np.uint8)
+    annotator = AIAnnotator()
+    early_first = _candidate(180, 180, hp=140, health=0.45, killable=False)
+    early_second = _candidate(40, 40, hp=150, health=0.5, killable=False, kind="red melee minion")
 
+    rendered = annotator(candidates=[early_first, early_second], img=frame)
+    assert tuple(rendered[180, 200]) == EARLY_PRIMARY_COLOR
+    assert tuple(rendered[40, 60]) == EARLY_SECONDARY_COLOR
 
-def test_hp_label_cli_flags():
-    parser = build_arg_parser()
-    defaults = parser.parse_args([])
-    assert defaults.hp_labels is True
-    assert defaults.hp_label_below == pytest.approx(50.0)
-    assert defaults.hp_hold_ms > 0
-    assert parser.parse_args(["--no-hp_labels"]).hp_labels is False
-    assert parser.parse_args(["--hp_labels", "False"]).hp_labels is False
-    assert parser.parse_args(["--hp_label_below", "70"]).hp_label_below == 70.0
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--hp_label_below", "0"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--hp_hold_ms", "-5"])
-
-
-def test_damage_table_level_scaling_and_minion_mitigation():
-    from my_utils.modules import damage_table as dt
-
-    assert dt.level_growth(1) == 0.0
-    assert dt.level_growth(2) == pytest.approx(0.72)
-    assert dt.level_growth(3) == pytest.approx(1.475)
-    with pytest.raises(ValueError):
-        dt.level_growth(0)
-    with pytest.raises(ValueError):
-        dt.level_growth(19)
-
-    assert dt.mitigation(0) == pytest.approx(1.0)
-    assert dt.mitigation(-10) == pytest.approx(1.0)     # never amplifies damage
-    assert dt.mitigation(100) == pytest.approx(0.5)
-    assert dt.mitigation(30) == pytest.approx(100.0 / 130.0)
-
-    assert dt.ITEMS["doran_blade"].attack_damage == 8.0
-    assert dt.ITEMS["long_sword"].attack_damage == 10.0
-    assert dt.ITEMS["doran_ring"].ability_power == 15.0
-    assert dt.ITEMS["amplifying_tome"].ability_power == 20.0
-    assert dt.resolve_item("Doran's Ring").key == "doran_ring"
-    assert dt.resolve_item("dorans blade").key == "doran_blade"
-    assert dt.resolve_item(None).key == "none"
-    with pytest.raises(ValueError):
-        dt.resolve_item("Infinity Edge")
-
-
-def test_damage_estimate_uses_champion_stats_items_and_armour():
-    from my_utils.modules import damage_table as dt
-
-    table = dt.champion_table()
-    assert len(table) >= 150, "the committed champion table must cover the roster"
-    assert dt.data_patch()
-
-    stats = dt.resolve_champion("aatrox")
-    assert stats.name == "Aatrox"
-    assert stats.attack_damage_at(1) == pytest.approx(stats.attack_damage)
-    assert stats.attack_damage_at(2) == pytest.approx(
-        stats.attack_damage + stats.attack_damage_per_level * 0.72
+    live = annotator(candidates=[_candidate(180, 180, hp=40)], img=frame)
+    assert tuple(live[180, 200]) == PRIMARY_TARGET_COLOR
+    live_second = annotator(
+        candidates=[_candidate(180, 180, hp=40), _candidate(40, 40, hp=40, kind="red melee minion")],
+        img=frame,
     )
-    assert stats.attack_damage_at(3) == pytest.approx(
-        stats.attack_damage + stats.attack_damage_per_level * 1.475
-    )
-    assert stats.ability_power_at(1) == 0.0     # no champion has base AP
-
-    # Case/punctuation-insensitive lookup, with aliases for awkward names.
-    assert dt.resolve_champion("AATROX").name == "Aatrox"
-    assert dt.resolve_champion("mundo").name == dt.resolve_champion("Dr. Mundo").name
-    with pytest.raises(ValueError):
-        dt.resolve_champion("NotARealChampion")
-
-    estimate = dt.estimate_damage("Aatrox", level=1, item="doran_blade")
-    assert estimate.attack_damage == pytest.approx(stats.attack_damage + 8.0)
-    assert estimate.basic_attack_damage == pytest.approx(stats.attack_damage + 8.0)
-    assert estimate.ability_power == 0.0
-    assert estimate.effective_damage == pytest.approx(estimate.basic_attack_damage)
-    assert estimate.hits_to_kill == 5   # 300 HP caster minion / 68 damage
-
-    armoured = dt.estimate_damage("Aatrox", level=1, item="doran_blade", minion_armor=30)
-    assert armoured.basic_attack_damage == pytest.approx((stats.attack_damage + 8.0) * 100 / 130)
-    assert armoured.effective_damage < estimate.effective_damage
-
-    # AP never adds to a basic attack; it only matters for the (opt-in) ability hit.
-    ap_estimate = dt.estimate_damage("Ahri", level=1, item="doran_ring")
-    assert ap_estimate.ability_power == pytest.approx(15.0)
-    assert ap_estimate.basic_attack_damage == pytest.approx(
-        dt.resolve_champion("Ahri").attack_damage
-    )
-    assert ap_estimate.ability_damage is None
-
-    spell = dt.estimate_damage("Ahri", level=1, item="doran_ring", ap_ratio=0.6, ability_base=80)
-    assert spell.ability_damage == pytest.approx(80 + 0.6 * 15)
-    # The damage value handed to the companion stays a conservative per-hit number.
-    assert spell.effective_damage == pytest.approx(
-        min(spell.basic_attack_damage, spell.ability_damage)
-    )
-
-    with pytest.raises(ValueError):
-        dt.estimate_damage("Ahri", level=0)
-    with pytest.raises(ValueError):
-        dt.estimate_damage("Ahri", ap_ratio=-1)
-
-
-def test_damage_table_rendering_and_cli():
-    from my_utils.modules import damage_table as dt
-
-    text = dt.format_table(["Ahri", "Aatrox"], item="doran_blade")
-    assert "Champion" in text and "Base AD 1/2/3" in text
-    assert "Ahri" in text and "Aatrox" in text
-    assert "Doran's Blade" in text and "Hits vs 300 HP" in text
-    assert dt.data_patch() in text
-
-    ap_text = dt.format_table(["Ahri"], item="doran_ring", ap_ratio=0.6, ability_base=80)
-    assert "AP" in ap_text and "Ability" in ap_text
-
-    parser = build_arg_parser()
-    args = parser.parse_args(
-        ["--champion", "Ahri", "--level", "2", "--item", "doran_ring", "--minion_armor", "30"]
-    )
-    assert args.champion == "Ahri" and args.level == 2
-    assert args.item == "doran_ring" and args.minion_armor == 30.0
-    assert parser.parse_args([]).effective_damage is None, (
-        "--effective_damage must stay unset so --champion can supply it"
-    )
-
-    import main as main_module
-
-    assert main_module.main(["--damage_table", "Ahri", "Aatrox"]) == 0
-    assert main_module.main(["--damage_table"]) == 0     # whole roster
-    with pytest.raises(SystemExit):
-        main_module.main(["--damage_table", "NotARealChampion"])
-
-
-def test_main_derives_effective_damage_from_champion_and_keeps_explicit_override(
-    monkeypatch, capsys
-):
-    import main as main_module
-    from my_utils.modules import damage_table as dt
-
-    img = np.zeros((300, 400, 3), dtype=np.uint8)
-    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
-
-    class FakeDetector:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __call__(self, _frame):
-            return {
-                "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
-                "red_health_bars": [((100, 90, 160, 98), 0.89)],
-                "blue_minions": [],
-                "blue_health_bars": [],
-            }
-
-    remaining = [CapturedFrame(image=img.copy(), captured_at=1.0) for _ in range(2)]
-
-    class FakeFrameLoader:
-        monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
-        primary_monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_exc):
-            return False
-
-        def grab(self, window_rect=None):
-            if not remaining:
-                raise KeyboardInterrupt
-            return remaining.pop(0)
-
-    monkeypatch.setattr(main_module, "Detector", FakeDetector)
-    monkeypatch.setattr(main_module, "FrameLoader", FakeFrameLoader)
-
-    with pytest.raises(KeyboardInterrupt):
-        main_module.main(
-            ["--sync", "--no-visualize", "--no-overlay", "--champion", "Ahri",
-             "--level", "2", "--item", "doran_ring"]
-        )
-    out = capsys.readouterr().out
-    expected = dt.estimate_damage("Ahri", level=2, item="doran_ring").effective_damage
-    assert "Damage estimate" in out
-    assert f"--effective_damage {expected:.1f}" in out
-
-    # An explicit --effective_damage always wins over the estimate.
-    remaining.extend(CapturedFrame(image=img.copy(), captured_at=1.0) for _ in range(2))
-    with pytest.raises(KeyboardInterrupt):
-        main_module.main(
-            ["--sync", "--no-visualize", "--no-overlay", "--champion", "Ahri",
-             "--effective_damage", "120"]
-        )
-    out = capsys.readouterr().out
-    assert "explicit value wins" in out
+    assert tuple(live_second[40, 60]) == SECONDARY_TARGET_COLOR
+    # No text is drawn anywhere (a number would show up as pixels above the box).
+    assert np.count_nonzero(rendered[150:178, 150:260]) == 0
+    assert np.count_nonzero(rendered[300:, 200:]) == 0

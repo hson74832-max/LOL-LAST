@@ -24,9 +24,12 @@ from my_utils.modules.performance import (
     set_torch_threads,
     validate_fps,
 )
-from my_utils.modules import damage_table as damage_model
-from my_utils.modules.hp_labels import HpLabelTracker
-from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
+from my_utils.modules.last_hitter import (
+    DEFAULT_EARLY_MARKER_THRESHOLD,
+    LastHitAdvisor,
+    LastHitCandidate,
+    LastHitSettings,
+)
 from my_utils.modules.stability import CandidateGate
 from my_utils.modules.tracking import MinionTracker
 from my_utils.visualizers.annotator import AIAnnotator
@@ -45,17 +48,17 @@ DEFAULT_MAX_DETECTION_AGE = 0.35
 DEFAULT_INFER_FPS = 12.0
 DEFAULT_LOOP_FPS = 30.0
 DEFAULT_OVERLAY_FPS = 30.0
-# Confirmed markers are held this long while a minion's health bar flickers.
-DEFAULT_HOLD_MS = 250.0
+# A marker is kept this long while a minion's body/bar flickers or a death
+# animation hides it. Held markers are dimmed; a killed minion is dropped at once.
+DEFAULT_HOLD_MS = 5000.0
 DEFAULT_CONFIRM_FRAMES = 2
 DEFAULT_BAR_MIN_CONFIDENCE = 0.20
-# HP numbers above the head appear once a minion is at or below this HP percent...
-DEFAULT_HP_LABEL_BELOW = 50.0
-# ...and then stay with the minion until it dies (this grace covers flicker).
-DEFAULT_HP_HOLD_MS = 1000.0
 DEFAULT_EFFECTIVE_DAMAGE = 80.0
-# Falling back on a champion's level-1 basic attack when no damage was supplied.
-DEFAULT_CHAMPION_LEVEL = 1
+# A minion is marked orange once its conservative HP is within this multiple of
+# your damage (2x damage = it dies from two basic attacks); see
+# my_utils.modules.last_hitter.DEFAULT_EARLY_MARKER_THRESHOLD, used directly.
+# Below this HP percentage a minion that vanishes was killed (marker removed at once).
+DEFAULT_KILL_HEALTH_PERCENT = 3.0
 
 DEFAULT_MAX_HEALTH = {
     "caster": 300.0,
@@ -159,13 +162,13 @@ def _fps(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _percent(value: str) -> float:
+def _at_least_one(value: str) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(f"expected a percentage, got {value!r}") from exc
-    if not np.isfinite(number) or not 0 < number <= 100:
-        raise argparse.ArgumentTypeError(f"expected a percentage above 0 and at most 100, got {value!r}")
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not np.isfinite(number) or number < 1:
+        raise argparse.ArgumentTypeError(f"expected a number of at least 1, got {value!r}")
     return number
 
 
@@ -286,11 +289,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-effective_damage",
         dest="effective_damage",
         type=float,
-        default=None,
+        default=DEFAULT_EFFECTIVE_DAMAGE,
         help=(
             "Conservative lower bound on post-mitigation basic-attack damage. "
-            f"Defaults to {DEFAULT_EFFECTIVE_DAMAGE:.0f}, or to the estimate computed "
-            "from --champion/--level/--item when those are given."
+            f"Defaults to {DEFAULT_EFFECTIVE_DAMAGE:.0f}. This also drives the early "
+            "(orange) marker threshold: a minion is marked once its HP is within "
+            "--early_marker_threshold times this damage."
         ),
     )
     parser.add_argument(
@@ -362,154 +366,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_non_negative_float,
         default=DEFAULT_HOLD_MS,
         help=(
-            "Keep a confirmed marker for this many milliseconds after its minion stops "
-            f"being detected (default {DEFAULT_HOLD_MS:.0f}; 0 disables holding). This stops "
-            "a nearly-dead minion's marker from blinking off while its 2px health bar is "
-            "unreadable. Held markers keep the last HP reading and are drawn dimmed."
+            "Keep a marker for this many milliseconds after its minion stops being "
+            f"detected (default {DEFAULT_HOLD_MS:.0f}; 0 disables holding). This keeps the "
+            "indicator with the minion while its 2px health bar is unreadable or a death "
+            "animation hides it. A minion that was killed loses its marker immediately; "
+            "a minion that merely left the view loses it after this grace period. Kept "
+            "markers keep the last position/reading and are drawn dimmed."
         ),
     )
     parser.add_argument(
-        "--overlay_labels",
-        nargs="?",
-        const=True,
-        default=True,
-        type=_parse_bool,
+        "--early_marker_threshold",
+        type=_at_least_one,
+        default=DEFAULT_EARLY_MARKER_THRESHOLD,
         help=(
-            "Show the estimated remaining HP number above each marker on the desktop "
-            "overlay (default True). Disable with --no-overlay_labels."
+            "A minion gets its orange 'getting low' marker once its conservative HP is "
+            "within this multiple of --effective_damage (default "
+            f"{DEFAULT_EARLY_MARKER_THRESHOLD:g}: two basic attacks). The marker turns "
+            "yellow/green as soon as the minion can actually be last-hit, and stays "
+            "until the minion dies. 1 disables the orange stage."
         ),
     )
     parser.add_argument(
-        "--no-overlay_labels",
-        dest="overlay_labels",
-        action="store_false",
-        help="Hide the HP numbers on the desktop overlay.",
-    )
-    parser.add_argument(
-        "--overlay_label_mode",
-        choices=("hp", "hp_damage", "percent"),
-        default="hp",
-        help=(
-            "'hp' shows the estimated remaining HP (default), 'hp_damage' shows "
-            "'HP/your damage' so the kill margin is visible, 'percent' shows the bar "
-            "percentage."
-        ),
-    )
-    parser.add_argument(
-        "--hp_labels",
-        nargs="?",
-        const=True,
-        default=True,
-        type=_parse_bool,
-        help=(
-            "Show the estimated HP number above every minion that is at or below "
-            "--hp_label_below percent HP, not only above last-hittable ones "
-            "(default True). The number stays with the minion until it dies. "
-            "Disable with --no-hp_labels."
-        ),
-    )
-    parser.add_argument(
-        "--no-hp_labels",
-        dest="hp_labels",
-        action="store_false",
-        help="Only show a number above last-hittable minions (marker labels only).",
-    )
-    parser.add_argument(
-        "--hp_label_below",
-        type=_percent,
-        default=DEFAULT_HP_LABEL_BELOW,
-        help=(
-            "HP percentage at which a minion starts showing a number above its head "
-            f"(default {DEFAULT_HP_LABEL_BELOW:.0f}). Once shown, the number is kept "
-            "until the minion dies, even if a single bar reading flickers above it."
-        ),
-    )
-    parser.add_argument(
-        "--hp_hold_ms",
+        "--kill_health_percent",
         type=_non_negative_float,
-        default=DEFAULT_HP_HOLD_MS,
+        default=DEFAULT_KILL_HEALTH_PERCENT,
         help=(
-            "Keep an HP number this many milliseconds after its minion stops being "
-            f"detected (default {DEFAULT_HP_HOLD_MS:.0f}), so a dying minion's number "
-            "does not blink out one frame early. Held numbers are drawn dimmed with "
-            "a '?'. 0 = no holding."
-        ),
-    )
-    parser.add_argument(
-        "--champion",
-        type=str,
-        default=None,
-        help=(
-            "Your champion, used to estimate --effective_damage from real base stats "
-            "(--level, --item, --bonus_ad). Example: --champion Ahri."
-        ),
-    )
-    parser.add_argument(
-        "--level",
-        type=int,
-        default=DEFAULT_CHAMPION_LEVEL,
-        help=f"Champion level for the damage estimate (default {DEFAULT_CHAMPION_LEVEL}).",
-    )
-    parser.add_argument(
-        "--item",
-        type=str,
-        default="none",
-        help=(
-            "Starting item for the damage estimate: "
-            + ", ".join(sorted(damage_model.ITEMS))
-            + " (default none)."
-        ),
-    )
-    parser.add_argument(
-        "--bonus_ad",
-        type=float,
-        default=0.0,
-        help="Extra flat attack damage from runes/items not covered by --item.",
-    )
-    parser.add_argument(
-        "--bonus_ap",
-        type=float,
-        default=0.0,
-        help="Extra flat ability power from runes/items not covered by --item.",
-    )
-    parser.add_argument(
-        "--minion_armor",
-        type=float,
-        default=damage_model.DEFAULT_MINION_ARMOR,
-        help=(
-            "Armour of the minions you last-hit, used to mitigate the damage estimate "
-            f"(default {damage_model.DEFAULT_MINION_ARMOR:.0f}: caster/melee minions; "
-            "siege minions are noticeably armoured, so raise it for those)."
-        ),
-    )
-    parser.add_argument(
-        "--ap_ratio",
-        type=float,
-        default=None,
-        help=(
-            "Optional AP ratio of the ability you last-hit with (e.g. 0.6), used to "
-            "estimate ability damage from AP. Off by default."
-        ),
-    )
-    parser.add_argument(
-        "--ability_base",
-        type=float,
-        default=None,
-        help=(
-            "Optional flat damage of that ability at its current rank, so ability "
-            "damage is base + ratio x AP instead of ratio x AP only."
-        ),
-    )
-    parser.add_argument(
-        "--damage_table",
-        nargs="*",
-        default=None,
-        metavar="CHAMPION",
-        help=(
-            "Print the base AD/AP table for levels 1-3 (all champions, or only the "
-            "named ones), including a starting item and the resulting basic-attack "
-            "damage on minions, then exit. Uses --level/--item/--bonus_ad/--bonus_ap/"
-            "--minion_armor/--ap_ratio/--ability_base."
+            "A marked minion whose last reading was at or below this HP percentage is "
+            "treated as killed, so its marker disappears immediately instead of being "
+            f"kept for --hold_ms (default {DEFAULT_KILL_HEALTH_PERCENT:g}; 0 disables "
+            "the death detection)."
         ),
     )
     parser.add_argument(
@@ -671,7 +556,6 @@ def process_frame(
     gate: CandidateGate | None = None,
     pipeline_stats: dict | None = None,
     tracker: MinionTracker | None = None,
-    hp_tracker: HpLabelTracker | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Evaluate a single frame and return (prioritized_last_hit_candidates, visualized_frame)."""
     detection_result = detector(captured_frame.image)
@@ -682,13 +566,6 @@ def process_frame(
         excluded_regions=captured_frame.excluded_regions,
     )
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
-    # HP numbers are independent of eligibility: they appear as soon as a minion is
-    # low enough and then stay with it until it dies.
-    labels = (
-        hp_tracker.update(matched_minions, now=captured_frame.captured_at)
-        if hp_tracker is not None
-        else []
-    )
     if pipeline_stats is not None:
         pipeline_stats.update(
             matched=len(matched_minions),
@@ -709,9 +586,9 @@ def process_frame(
     if pipeline_stats is not None:
         pipeline_stats["kept"] = len(candidates)
         pipeline_stats["held"] = sum(1 for c in candidates if c.held)
-        pipeline_stats["hp_labels"] = len(labels)
+        pipeline_stats["early"] = sum(1 for c in candidates if not c.killable)
     visualized = (
-        annotator(candidates=candidates, img=captured_frame.image, labels=labels)
+        annotator(candidates=candidates, img=captured_frame.image)
         if annotator is not None
         else None
     )
@@ -743,7 +620,6 @@ def evaluate_with_latest_detections(
     allow_stale_frame_fallback: bool = False,
     pipeline_stats: dict | None = None,
     tracker: MinionTracker | None = None,
-    hp_tracker: HpLabelTracker | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Re-evaluate health bars on the live frame using the newest detector boxes.
 
@@ -752,10 +628,8 @@ def evaluate_with_latest_detections(
     minion that died, or another minion entirely, while the camera scrolls.
     """
     def _empty():
-        if hp_tracker is not None:
-            hp_tracker.reset()
         visualized = (
-            annotator(candidates=[], img=captured_frame.image, copy=False, labels=[])
+            annotator(candidates=[], img=captured_frame.image, copy=False)
             if annotator is not None
             else None
         )
@@ -796,11 +670,6 @@ def evaluate_with_latest_detections(
         )
 
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
-    labels = (
-        hp_tracker.update(matched_minions, now=captured_frame.captured_at)
-        if hp_tracker is not None
-        else []
-    )
     if pipeline_stats is not None:
         pipeline_stats.update(
             matched=len(matched_minions),
@@ -823,11 +692,11 @@ def evaluate_with_latest_detections(
     if pipeline_stats is not None:
         pipeline_stats["kept"] = len(candidates)
         pipeline_stats["held"] = sum(1 for c in candidates if c.held)
-        pipeline_stats["hp_labels"] = len(labels)
+        pipeline_stats["early"] = sum(1 for c in candidates if not c.killable)
     # The live frame was just handed to the detection worker; annotating it in
     # place would let YOLOv9 read half-drawn boxes, so always render on a copy.
     visualized = (
-        annotator(candidates=candidates, img=captured_frame.image, copy=True, labels=labels)
+        annotator(candidates=candidates, img=captured_frame.image, copy=True)
         if annotator is not None
         else None
     )
@@ -880,69 +749,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--confirm_frames must be at least 1")
     if not 0 < args.min_bar_confidence <= 1:
         parser.error("--min_bar_confidence must be greater than 0 and at most 1")
-    if not 0 < args.hp_label_below <= 100:
-        parser.error("--hp_label_below must be greater than 0 and at most 100")
-    if not 1 <= args.level <= 18:
-        parser.error("--level must be between 1 and 18")
-
-    if args.damage_table is not None:
-        try:
-            print(
-                damage_model.format_table(
-                    args.damage_table,
-                    item=args.item,
-                    bonus_ad=args.bonus_ad,
-                    bonus_ap=args.bonus_ap,
-                    minion_armor=args.minion_armor,
-                    ap_ratio=args.ap_ratio,
-                    ability_base=args.ability_base,
-                )
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-        return 0
-
-    # --effective_damage is the one value the companion cannot read from the
-    # screen.  It is either given explicitly or estimated from the champion.
-    effective_damage = args.effective_damage
-    estimate = None
-    if args.champion is not None:
-        try:
-            estimate = damage_model.estimate_damage(
-                args.champion,
-                level=args.level,
-                item=args.item,
-                bonus_ad=args.bonus_ad,
-                bonus_ap=args.bonus_ap,
-                minion_armor=args.minion_armor,
-                ap_ratio=args.ap_ratio,
-                ability_base=args.ability_base,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-        if effective_damage is None:
-            effective_damage = estimate.effective_damage
-    if effective_damage is None:
-        effective_damage = DEFAULT_EFFECTIVE_DAMAGE
-
-    # Report the estimate before the (slow) model load so it shows up immediately.
-    if estimate is not None:
-        print(f"[INFO] Damage estimate: {estimate.describe()}.")
-        if args.effective_damage is None:
-            print(
-                f"[INFO] Using --effective_damage {effective_damage:.1f} from that estimate "
-                f"({damage_model.describe_item(estimate.item)}, level {estimate.level}, "
-                f"minion armour {args.minion_armor:.0f}); override it with --effective_damage."
-            )
-        elif abs(args.effective_damage - estimate.effective_damage) > 0.5:
-            print(
-                f"[NOTE] Your --effective_damage {args.effective_damage:.1f} differs from the "
-                f"{estimate.effective_damage:.1f} this champion/level/item predicts; the "
-                "explicit value wins."
-            )
+    if not 0 <= args.kill_health_percent <= 100:
+        parser.error("--kill_health_percent must be between 0 and 100 (0 disables)")
 
     settings = LastHitSettings(
-        effective_damage=effective_damage,
+        effective_damage=args.effective_damage,
         max_health={
             "caster": args.caster_max_hp,
             "melee": args.melee_max_hp,
@@ -952,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
         min_confidence=args.min_confidence,
         player_anchor=tuple(args.player_anchor),
         max_distance=args.max_distance,
+        early_marker_threshold=args.early_marker_threshold,
     )
 
     priority_status = apply_process_priority(args.priority)
@@ -975,32 +787,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     advisor = LastHitAdvisor(settings)
     gate = CandidateGate(confirm_frames=args.confirm_frames)
-    tracker = MinionTracker(hold_ms=args.hold_ms)
-    hp_tracker = (
-        HpLabelTracker(
-            max_health=settings.max_health,
-            threshold_percent=args.hp_label_below,
-            hold_ms=args.hp_hold_ms,
-            health_margin=settings.health_margin,
-            min_confidence=settings.min_confidence,
-        )
-        if args.hp_labels
-        else None
+    tracker = MinionTracker(
+        hold_ms=args.hold_ms,
+        kill_health_percent=args.kill_health_percent,
     )
-    if hp_tracker is not None:
-        print(
-            f"[INFO] HP numbers appear on minions at or below {args.hp_label_below:.0f}% HP "
-            f"and stay until the minion dies (held {args.hp_hold_ms:.0f} ms after a lost reading)."
-        )
-    else:
-        print("[INFO] HP numbers are only drawn above last-hittable minions.")
     print(
         f"[INFO] Markers require {args.confirm_frames} consecutive frame(s); detector boxes "
         f"older than {args.max_detection_age * 1000:.0f} ms are ignored; "
         f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}; "
-        f"geometric health-bar reading {'on' if args.bar_locator else 'off'}; "
-        f"markers held {args.hold_ms:.0f} ms after a minion disappears."
+        f"geometric health-bar reading {'on' if args.bar_locator else 'off'}."
     )
+    if args.early_marker_threshold > 1:
+        print(
+            f"[INFO] Markers: orange once a minion's HP is within "
+            f"{args.early_marker_threshold:g}x your {settings.effective_damage:.0f} damage, "
+            "yellow/green as soon as it can be last-hit, kept until the minion dies "
+            f"(a killed minion loses its marker at once; a vanished one after "
+            f"{args.hold_ms:.0f} ms)."
+        )
+    else:
+        print(
+            "[INFO] Markers: yellow/green only for minions that can be last-hit now, kept "
+            f"until the minion dies (a killed minion loses its marker at once; a vanished "
+            f"one after {args.hold_ms:.0f} ms)."
+        )
     print(
         f"[INFO] Pacing: capture loop {args.max_fps or 'unlimited'} fps, detection "
         f"{args.infer_fps or 'unlimited'} fps, overlay {args.overlay_fps or 'unlimited'} fps."
@@ -1108,7 +918,6 @@ def main(argv: list[str] | None = None) -> int:
                         allow_stale_frame_fallback=args.stale_frame_fallback,
                         pipeline_stats=pipeline_stats,
                         tracker=tracker,
-                        hp_tracker=hp_tracker,
                     )
                 else:
                     candidates, visualized = process_frame(
@@ -1121,7 +930,6 @@ def main(argv: list[str] | None = None) -> int:
                         gate=gate,
                         pipeline_stats=pipeline_stats,
                         tracker=tracker,
-                        hp_tracker=hp_tracker,
                     )
 
                 timings.add("evaluate", time.perf_counter() - evaluate_started)
@@ -1158,9 +966,6 @@ def main(argv: list[str] | None = None) -> int:
                             primary_width=frame_loader.primary_monitor["width"],
                             marker_gap=args.overlay_gap,
                             max_fps=args.overlay_fps or 60.0,
-                            show_labels=args.overlay_labels,
-                            label_mode=args.overlay_label_mode,
-                            damage=settings.effective_damage,
                         )
                     except (OverlayUnavailable, ValueError) as exc:
                         overlay_failed = True
@@ -1168,11 +973,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 if overlay is not None:
                     with timings.measure("overlay"):
-                        overlay.render(
-                            candidates,
-                            captured.image.shape,
-                            labels=hp_tracker.last_labels if hp_tracker is not None else None,
-                        )
+                        overlay.render(candidates, captured.image.shape)
                     if overlay.closed:
                         overlay_failed = True
                         overlay = None

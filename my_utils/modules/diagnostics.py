@@ -41,7 +41,7 @@ class FrameStats:
     eligible: int = 0
     kept: int = 0
     held: int = 0
-    hp_labels: int = 0
+    early: int = 0
     health: list[float] = field(default_factory=list)
     stale: bool = False
     detection_age: float | None = None
@@ -87,7 +87,7 @@ def stats_from_frame(
         eligible=int(pipeline.get("eligible", 0)),
         kept=int(pipeline.get("kept", 0)),
         held=int(pipeline.get("held", 0)),
-        hp_labels=int(pipeline.get("hp_labels", 0)),
+        early=int(pipeline.get("early", 0)),
         health=[float(v) for v in pipeline.get("health", []) if isfinite(float(v))],
         stale=bool(pipeline.get("stale", False)),
         detection_age=detection_age_seconds,
@@ -123,7 +123,7 @@ def format_stats(
         f"geo bars={stats.locator_matches}) hp=[{health}] | "
         f"eligible={stats.eligible} drawn={stats.kept}"
         + (f" (held {stats.held})" if stats.held else "")
-        + (f" hp_labels={stats.hp_labels}" if stats.hp_labels else "")
+        + (f" early={stats.early}" if stats.early else "")
         + " | "
         f"infer={_ms(stats.inference_seconds)} box_age={_ms(stats.detection_age)}"
     )
@@ -234,26 +234,40 @@ def annotate_debug_frame(image, detection_result, candidates, minion_color: str 
 
 
 def describe_thresholds(settings, minion_color: str = "red") -> list[str]:
-    """Explain which HP fraction counts as last-hittable for each minion type."""
+    """Explain, per minion type, when a marker turns orange and when it turns yellow."""
+    early_multiple = getattr(settings, "early_marker_threshold", 1.0) or 1.0
     lines = [
         f"effective_damage={settings.effective_damage:.0f} "
+        f"early_marker_threshold={early_multiple:g}x "
         f"health_margin={settings.health_margin:g} min_confidence={settings.min_confidence:g}"
     ]
     for minion_type in ("caster", "melee", "siege"):
         max_hp = settings.max_health.get(minion_type)
         if not max_hp:
             continue
-        # health_upper_bound = min(1, hp + margin) * max_hp <= effective_damage
-        fraction = settings.effective_damage / max_hp - settings.health_margin
+        # health_upper_bound = min(1, hp + margin) * max_hp, compared with
+        # effective_damage for yellow and effective_damage x multiple for orange.
+        kill_fraction = settings.effective_damage / max_hp - settings.health_margin
+        early_fraction = settings.effective_damage * early_multiple / max_hp - settings.health_margin
         label = f"{minion_color} {minion_type}"
-        if fraction <= 0:
-            lines.append(f"{label:<18}: never last-hittable (damage below the margin)")
-        elif fraction >= 1:
-            lines.append(f"{label:<18}: any HP (whole bar would be lethal)")
-        else:
+        if early_fraction <= 0:
             lines.append(
-                f"{label:<18}: only while the bar reads <= {100 * fraction:.0f}% HP"
+                f"{label:<18}: never marked - never last-hittable "
+                "(damage below the margin)"
             )
+            continue
+        kills = (
+            "yellow at any HP (whole bar would be lethal)"
+            if kill_fraction >= 1
+            else "never yellow (not killable with this damage)"
+            if kill_fraction <= 0
+            else f"yellow while the bar reads <= {100 * kill_fraction:.0f}% HP"
+        )
+        early = (
+            "orange at any HP" if early_fraction >= 1
+            else f"orange while the bar reads <= {100 * early_fraction:.0f}% HP"
+        )
+        lines.append(f"{label:<18}: {early}, {kills}")
     return lines
 
 
