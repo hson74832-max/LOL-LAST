@@ -106,12 +106,20 @@ There is **one marker per minion** and it goes through three states. No numbers 
                        reading for that minion (bar unreadable, body hidden)
 ```
 
+**Orange is replaced the moment the minion can be killed.** The colour always follows the current reading: the frame a minion's HP drops within `--effective_damage` the orange marker is gone and the yellow (or green) one is there — no lingering orange, no gap. This works because the orange stage is tracked too, so the minion does not have to be re-confirmed as a "new" minion when it crosses the threshold (that confirmation delay was why the yellow marker used to be skipped whenever a health bar flickered around the threshold).
+
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--effective_damage` | `80` | Your post-mitigation basic-attack damage; the yellow/green threshold |
 | `--early_marker_threshold` | `2` | Orange starts once HP ≤ this × your damage (`2` = it dies from two basic attacks; `1` disables the orange stage) |
 | `--hold_ms` | `5000` | How long a marker survives after its minion stops being detected |
 | `--kill_health_percent` | `3` | A marked minion whose last reading was at or below this HP % counts as killed, so its marker is dropped at once (`0` disables) |
+| `--confirm_frames` | `2` | Detector results required before a **yellow/green** marker is trusted. Orange sightings of the same minion count towards it, so the switch to yellow is instant. |
+
+### What the green markers are
+Green is the **second and further minions that can be last-hit at the same moment** as the yellow `#1` one: yellow is the nearest killable minion (your priority), green marks the other killable minions in the same wave so a second last hit right after the first is visible. They are the same shape and the same rule as yellow, only "not the top priority".
+
+If you have never seen one, that is expected: green needs **two minions inside your damage range at the same time**. With `--effective_damage 80` that means two minions below ~27 % of a caster bar simultaneously, which usually lasts a fraction of a second. Orange (`#2+`, darker orange) is what you see most often for the rest of the wave. If you would rather see a single marker only, prefer a lower `--early_marker_threshold` and/or a smaller `--max_distance`.
 
 How "kept until the minion dies" works without ever marking a corpse:
 
@@ -170,7 +178,7 @@ Confusing or delayed markers come from two places: **stale detections** (boxes f
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--max_detection_age` | `0.35` s | Detector boxes older than this are **discarded** instead of being drawn on the live frame. Lower (`0.15`–`0.25`) = stricter/snappier; raise it if your machine cannot infer that fast; `0` disables the limit. |
-| `--confirm_frames` | `2` | A candidate must be seen in that many **consecutive detector results** before it is drawn. Higher (3) = fewer flickers and no phantom markers, but slower to appear. `1` disables confirmation. |
+| `--confirm_frames` | `2` | A **yellow/green** marker needs that many consecutive detector results of the same minion (orange sightings count, so the switch to yellow stays instant). Orange markers themselves are drawn at once. Higher (3) = fewer phantom markers but slower first appearance; `1` disables confirmation. |
 | `--min_bar_confidence` | `0.20` | Minimum confidence for health bars (separate from bodies because low-HP bars score lower). Raise to `0.35`–`0.5` to reject corpse flashes and spell-effect artifacts. |
 | `--min_confidence` | `0.25` | Minimum confidence for minion bodies. Raise to `0.4`–`0.5` to suppress phantom boxes. |
 | `--stale_frame_fallback` | off | Legacy behaviour: when the live frame yields no match, re-run association on the previous frame. Off because that is exactly what produces delayed markers on dead minions. |
@@ -280,7 +288,7 @@ Last-hit maths:
 - `--min_confidence`: Minimum detection confidence for minion bodies (default `0.25`).
 - `--min_bar_confidence`: Minimum detection confidence for health bars (default `0.20`).
 - `--max_detection_age`: Maximum age in seconds of detector boxes reused on a live frame (default `0.35`, `0` disables).
-- `--confirm_frames`: Consecutive detector results a candidate must be seen in before it is drawn (default `2`).
+- `--confirm_frames`: Consecutive detector results a minion must be seen in before its **yellow/green** marker is drawn; orange sightings of the same minion count, and orange markers are drawn immediately (default `2`).
 - `--bar_locator` / `--no-bar_locator`: Read health bars geometrically around each body when YOLOv9 reports none (default on).
 - `--infer_fps`: Maximum YOLO inferences per second (default `12`, `0` = unlimited).
 - `--max_fps`: Maximum capture/processing frames per second (default `30`, `0` = unlimited).

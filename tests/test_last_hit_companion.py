@@ -2295,14 +2295,100 @@ def test_early_candidates_skip_the_confirmation_gate_but_killable_ones_do_not():
     out = gate.update([early], (300, 800, 3), generation=generation)
     assert out == [early]
 
-    # A killable marker still needs its consecutive sightings.
+    # A brand-new killable marker still needs its consecutive sightings.
     assert gate.update([killable], (300, 800, 3), generation=generation) == []
     out = gate.update([killable], (300, 800, 3), generation=object())
     assert [c.killable for c in out] == [True]
 
-    # Both kinds are reported together, killable first.
-    out = gate.update([early, killable], (300, 800, 3), generation=object())
+    # The gate preserves the caller's priority order (the advisor ranks killable
+    # minions first, so the yellow #1 marker stays the nearest killable minion).
+    out = gate.update([killable, early], (300, 800, 3), generation=object())
     assert [c.killable for c in out] == [True, False]
+
+
+def test_orange_turns_yellow_immediately_when_the_minion_becomes_killable():
+    """Regression: a bar flickering around the kill threshold used to hide the yellow."""
+    from my_utils.modules.stability import CandidateGate
+    from my_utils.modules.tracking import MinionTracker
+
+    settings = LastHitSettings(
+        effective_damage=80.0, max_health={"caster": 300.0}
+    )
+    advisor = LastHitAdvisor(settings)
+    gate = CandidateGate(confirm_frames=2)
+    tracker = MinionTracker(hold_ms=5000)
+    shape = (720, 1280, 3)
+
+    def step(hp, moment):
+        minion = Minion("red caster minion", hp, (100, 200, 140, 260), 0.9)
+        candidates = advisor.rank([minion], shape)
+        candidates = gate.update(candidates, shape, generation=object())
+        return tracker.update(candidates, shape, now=moment)
+
+    # Approaching: orange, drawn on the very first sighting.
+    first = step(0.45, 0.0)
+    assert len(first) == 1 and first[0].killable is False
+
+    # Second sighting is already killable (75 HP <= 80 damage): the yellow marker
+    # replaces the orange one immediately - no confirmation delay, no orange left.
+    second = step(0.25, 0.1)
+    assert len(second) == 1
+    assert second[0].killable is True and second[0].held is False
+    assert not any(not c.killable for c in second), "orange must be gone"
+
+    # Flickering around the threshold: every killable reading is drawn at once.
+    for moment, hp in ((0.2, 0.30), (0.3, 0.25), (0.4, 0.30), (0.5, 0.25)):
+        out = step(hp, moment)
+        assert len(out) == 1, f"one marker per minion at {hp:.0%}"
+        assert out[0].killable is (hp * 300.0 <= 80.0)
+        assert out[0].held is False
+
+    # A minion that appears killable out of nowhere is still confirmed first
+    # (anti-misread), and it is never shown as orange meanwhile.
+    fresh_gate = CandidateGate(confirm_frames=2)
+    fresh_tracker = MinionTracker(hold_ms=5000)
+    fresh = LastHitCandidate(
+        minion=Minion("red caster minion", 0.10, (600, 200, 640, 260), 0.9),
+        health_upper_bound=30.0,
+        distance=1.0,
+    )
+    assert fresh_tracker.update(
+        fresh_gate.update([fresh], shape, generation=object()), shape, now=0.0
+    ) == []
+    assert fresh_tracker.update(
+        fresh_gate.update([fresh], shape, generation=object()), shape, now=0.1
+    )[0].killable is True
+
+
+def test_secondary_markers_are_green_only_when_two_minions_are_killable_at_once():
+    """Green = #2+ minion that can be last-hit at the same time as the yellow one."""
+    from my_utils.visualizers.overlay import (
+        marker_color,
+        EARLY_SECONDARY_COLOR,
+        PRIMARY_TARGET_COLOR,
+        SECONDARY_TARGET_COLOR,
+    )
+
+    settings = LastHitSettings(effective_damage=80.0, max_health={"caster": 300.0})
+    advisor = LastHitAdvisor(settings)
+    shape = (720, 1280, 3)
+
+    def colours(hps):
+        minions = [
+            Minion("red caster minion", hp, (100 + i * 80, 200, 140 + i * 80, 260), 0.9)
+            for i, hp in enumerate(hps)
+        ]
+        ranked = advisor.rank(minions, shape)
+        return [marker_color(rank, c.killable, c.held) for rank, c in enumerate(ranked, start=1)]
+
+    # One killable minion + approaching ones: yellow, then two dark-orange markers.
+    assert colours([0.20, 0.45, 0.50])[:1] == [PRIMARY_TARGET_COLOR]
+    assert colours([0.20, 0.45, 0.50])[1:] == [EARLY_SECONDARY_COLOR, EARLY_SECONDARY_COLOR]
+    # Two (or three) killable minions at the same moment: the extra ones are green.
+    two = colours([0.20, 0.15, 0.50])
+    assert two[0] == PRIMARY_TARGET_COLOR and two[1] == SECONDARY_TARGET_COLOR
+    three = colours([0.20, 0.15, 0.10])
+    assert three == [PRIMARY_TARGET_COLOR, SECONDARY_TARGET_COLOR, SECONDARY_TARGET_COLOR]
 
 
 def test_marker_stays_while_the_minion_is_low_and_goes_when_it_dies():

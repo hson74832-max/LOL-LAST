@@ -8,9 +8,12 @@ immediately: holding a marker is exactly what makes the companion point at
 corpses.
 
 Minions that are only *approaching* last-hit range ("early"/orange candidates)
-are tracked the same way but do **not** go through the confirmation gate: they
-cannot be hit yet, so showing them a frame earlier is safe, and gating them would
-delay the orange marker that makes the yellow one appear on time.
+are shown immediately - they cannot be hit yet, so a frame of doubt does not
+matter - but they are still **tracked**.  That is what makes the switch to
+yellow/green instant: by the time a minion becomes killable it has already been
+seen for several detector results, so it does not have to be confirmed all over
+again (which used to hide the yellow marker whenever a bar flickered around the
+threshold).
 """
 
 from dataclasses import dataclass
@@ -66,11 +69,15 @@ class CandidateGate:
         self._generation = None
 
     def update(self, candidates, frame_shape=None, generation=None) -> list[LastHitCandidate]:
-        """Return candidates that have been stable for ``confirm_frames`` sightings.
+        """Return the candidates that may be drawn this frame.
 
-        Candidates with ``killable=False`` (minions getting low, not killable yet)
-        are passed through unchanged: the gate only guards markers that claim a
-        minion can be last-hit right now.
+        * A minion that is killable right now is drawn only after
+          ``confirm_frames`` consecutive sightings of **that minion** (orange
+          sightings count too, they are the same minion).
+        * A minion that is only approaching is drawn immediately: it cannot be
+          mis-clicked, and waiting would delay the orange marker.
+        * A minion that disappears is dropped immediately: holding a marker is
+          exactly what makes the companion point at corpses.
 
         ``generation`` is any object identifying the detector result behind the
         candidates (compared by identity and kept referenced).  A live frame is
@@ -85,25 +92,24 @@ class CandidateGate:
         new_generation = generation is not None and generation is not self._generation
         if generation is not None:
             self._generation = generation
-        candidates = list(candidates or [])
-        if not candidates:
+
+        # Every candidate is tracked, including the orange "approaching" ones, so a
+        # minion keeps its identity (and its sighting count) across the moment it
+        # becomes killable.
+        indexed = list(enumerate(candidates or []))
+        if not indexed:
             # Nothing seen this frame: every stale marker disappears immediately.
             self._tracks.clear()
             return []
-        passed_through = [c for c in candidates if not bool(getattr(c, "killable", True))]
-        candidates = [c for c in candidates if bool(getattr(c, "killable", True))]
-        if not candidates:
-            self._tracks.clear()
-            return passed_through
 
         measured = []
-        for index, candidate in enumerate(candidates):
+        for candidate_index, candidate in indexed:
             geometry = _center_and_size(getattr(candidate, "minion", None))
             if geometry is not None:
-                measured.append((index, candidate, geometry))
+                measured.append((candidate_index, candidate, geometry))
         if not measured:
             self._tracks.clear()
-            return passed_through
+            return []
 
         # Greedy nearest-neighbour matching, closest pairs first, so two neighbouring
         # minions in a wave are never merged into one track.
@@ -125,7 +131,7 @@ class CandidateGate:
             matched_measurements[measured_index] = track_index
 
         new_tracks: list[_Track] = []
-        confirmed = []
+        confirmed: set[int] = set()
         for measured_index, (candidate_index, candidate, (x, y, size)) in enumerate(measured):
             track_index = matched_measurements.get(measured_index)
             if track_index is None:
@@ -137,9 +143,15 @@ class CandidateGate:
                 hits = self._tracks[track_index].hits
             new_tracks.append(_Track(x=x, y=y, size=size, hits=hits))
             if hits >= self.confirm_frames:
-                confirmed.append((candidate_index, candidate))
+                confirmed.add(candidate_index)
 
         # Tracks vanish with their candidate: no memory of minions that are already dead.
         self._tracks = new_tracks
-        confirmed.sort(key=lambda item: item[0])
-        return [candidate for _, candidate in confirmed] + passed_through
+
+        visible = []
+        for candidate_index, candidate in indexed:
+            killable = bool(getattr(candidate, "killable", True))
+            # Orange is never gated, yellow/green only after confirmation.
+            if not killable or candidate_index in confirmed:
+                visible.append(candidate)
+        return visible
