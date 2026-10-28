@@ -7,6 +7,15 @@ never takes keyboard focus, so the companion stays fully read-only.
 Markers are drawn *above* each minion's bounding box (never on top of its health
 bar) which keeps the health-bar reading of the next captured frame intact.
 
+A marker has three visible states, and no text at all:
+
+* **orange** - the minion is getting low (its conservative HP is within
+  ``--early_marker_threshold`` x your damage) but cannot be last-hit yet,
+* **yellow** - the #1 priority minion that can be last-hit right now,
+* **green** - the other minions that can be last-hit right now,
+* dimmed/dashed - the marker is kept although the current frame has no fresh
+  reading for that minion (``candidate.held``).
+
 Tkinter is imported lazily: the module stays importable on machines without Tk
 (servers, headless CI) and :class:`OverlayUnavailable` is raised instead.
 """
@@ -19,18 +28,17 @@ import numpy as np
 # Colour key used for the fully transparent window areas.  A saturated magenta
 # is used because it effectively never occurs in a League of Legends frame.
 OVERLAY_KEY_COLOR = "#ff00fe"
-PRIMARY_TARGET_COLOR = "#ffff00"     # #1 priority last-hit target (yellow)
-SECONDARY_TARGET_COLOR = "#00c800"   # #2+ last-hittable minions (green)
-HELD_PRIMARY_COLOR = "#b8b800"       # dimmed yellow: marker held, minion not detected
+PRIMARY_TARGET_COLOR = "#ffff00"     # yellow: #1 minion that can be last-hit now
+SECONDARY_TARGET_COLOR = "#00c800"   # green: #2+ minions that can be last-hit now
+EARLY_PRIMARY_COLOR = "#ff9a00"      # orange: #1 minion that is getting low
+EARLY_SECONDARY_COLOR = "#d27300"    # darker orange: #2+ minions getting low
+HELD_PRIMARY_COLOR = "#b8b800"       # dimmed yellow: marker kept, reading stale
 HELD_SECONDARY_COLOR = "#009a00"     # dimmed green
-LABEL_MODES = ("hp", "hp_damage", "percent")
-LABEL_COLOR = "#ffffff"
-# Minions that are not last-hittable yet still get a number (--hp_labels), in a
-# softer colour so the actual last-hit targets stay the bright ones.
-HP_ONLY_LABEL_COLOR = "#dcdcdc"
-LABEL_OUTLINE = "#000000"
+HELD_EARLY_PRIMARY_COLOR = "#b86e00"  # dimmed orange
+HELD_EARLY_SECONDARY_COLOR = "#965200"
 
 DEFAULT_MARKER_GAP = 16.0            # frame pixels above the bounding box
+EARLY_MARKER_SCALE = 0.8             # approaching markers are a little smaller
 MIN_SCALE = 0.2
 MAX_SCALE = 5.0
 
@@ -64,21 +72,16 @@ def display_scale(logical_width, physical_width) -> float:
     return min(MAX_SCALE, max(MIN_SCALE, logical / physical))
 
 
-def _same_minion(box_a, box_b, tolerance_scale: float = 0.5) -> bool:
-    """True when two bounding boxes describe the same minion (same area on screen)."""
-    try:
-        ax = 0.5 * (float(box_a[0]) + float(box_a[2]))
-        ay = 0.5 * (float(box_a[1]) + float(box_a[3]))
-        bx = 0.5 * (float(box_b[0]) + float(box_b[2]))
-        by = 0.5 * (float(box_b[1]) + float(box_b[3]))
-        size = min(
-            abs(float(box_a[2]) - float(box_a[0])), abs(float(box_a[3]) - float(box_a[1])),
-            abs(float(box_b[2]) - float(box_b[0])), abs(float(box_b[3]) - float(box_b[1])),
-        )
-    except (TypeError, ValueError, IndexError):
-        return False
-    limit = max(4.0, tolerance_scale * size)
-    return (ax - bx) ** 2 + (ay - by) ** 2 <= limit * limit
+def marker_color(priority_rank: int, killable: bool = True, held: bool = False) -> str:
+    """Colour of one marker: orange = getting low, yellow/green = last-hit now."""
+    primary = 1 >= int(priority_rank)
+    if not killable:
+        if held:
+            return HELD_EARLY_PRIMARY_COLOR if primary else HELD_EARLY_SECONDARY_COLOR
+        return EARLY_PRIMARY_COLOR if primary else EARLY_SECONDARY_COLOR
+    if held:
+        return HELD_PRIMARY_COLOR if primary else HELD_SECONDARY_COLOR
+    return PRIMARY_TARGET_COLOR if primary else SECONDARY_TARGET_COLOR
 
 
 def marker_polygon(bbox, gap: float = DEFAULT_MARKER_GAP, size: float | None = None):
@@ -118,14 +121,7 @@ class DesktopOverlay:
         topmost: bool = True,
         ignore_input: bool = True,
         max_fps: float = 60.0,
-        show_labels: bool = True,
-        label_font: tuple = ("Segoe UI", 9, "bold"),
-        label_offset: float = 6.0,
-        label_mode: str = "hp",
-        damage: float | None = None,
     ) -> None:
-        if label_mode not in LABEL_MODES:
-            raise ValueError(f"label mode must be one of {', '.join(LABEL_MODES)}")
         try:
             left = int(monitor["left"])
             top = int(monitor["top"])
@@ -150,12 +146,6 @@ class DesktopOverlay:
         self.monitor_width = width
         self.monitor_height = height
         self.marker_gap = float(marker_gap)
-        self.show_labels = bool(show_labels)
-        self.label_font = label_font
-        self.label_offset = float(label_offset)
-        self.label_mode = label_mode
-        # Shown as "hp/damage" so the player sees the remaining margin at a glance.
-        self.damage = None if damage is None else float(damage)
         self._max_interval = 1.0 / max_fps if max_fps and max_fps > 0 else 0.0
         self._last_render = 0.0
         self._closed = False
@@ -220,14 +210,8 @@ class DesktopOverlay:
     def closed(self) -> bool:
         return self._closed
 
-    def render(self, candidates, frame_shape, labels=None) -> None:
-        """Redraw markers for ``candidates`` expressed in ``frame_shape`` coordinates.
-
-        ``labels`` is an optional second layer of HP numbers (see
-        :mod:`my_utils.modules.hp_labels`): minions that are not last-hittable yet
-        still show their remaining HP, without a marker triangle.  Numbers that
-        already belong to a candidate marker are not drawn twice.
-        """
+    def render(self, candidates, frame_shape) -> None:
+        """Redraw markers for ``candidates`` expressed in ``frame_shape`` coordinates."""
         if self._closed:
             return
         if not isinstance(frame_shape, (tuple, list)) or len(frame_shape) < 2:
@@ -245,12 +229,6 @@ class DesktopOverlay:
         scale_x = self.monitor_width * self._display_scale / width
         scale_y = self.monitor_height * self._display_scale / height
 
-        candidate_boxes = []
-        for candidate in candidates or []:
-            box = getattr(getattr(candidate, "minion", None), "bbox", None)
-            if box is not None and len(box) == 4:
-                candidate_boxes.append(tuple(float(v) for v in box))
-
         try:
             self._canvas.delete("all")
             for priority_rank, candidate in enumerate(candidates, start=1):
@@ -258,96 +236,31 @@ class DesktopOverlay:
                 bbox = getattr(minion, "bbox", None)
                 if bbox is None or len(bbox) != 4:
                     continue
+                killable = bool(getattr(candidate, "killable", True))
+                held = bool(getattr(candidate, "held", False))
+                size = self.marker_gap * 0.65
+                if not killable:
+                    size *= EARLY_MARKER_SCALE
                 try:
-                    points = marker_polygon(bbox, gap=self.marker_gap)
+                    points = marker_polygon(bbox, gap=self.marker_gap, size=size)
                 except (TypeError, ValueError):
                     continue
                 points = tuple((x * scale_x, y * scale_y) for x, y in points)
                 if not all(np.isfinite([coord for point in points for coord in point])):
                     continue
-                held = bool(getattr(candidate, "held", False))
-                if priority_rank == 1:
-                    color = HELD_PRIMARY_COLOR if held else PRIMARY_TARGET_COLOR
-                else:
-                    color = HELD_SECONDARY_COLOR if held else SECONDARY_TARGET_COLOR
                 flat = [coord for point in points for coord in point]
                 self._canvas.create_polygon(
                     *flat,
-                    fill=color,
+                    fill=marker_color(priority_rank, killable, held),
                     outline="#101010",
                     width=1,
-                    # Held markers are dashed so an expired reading is obvious.
+                    # A held marker is dashed so a stale reading is obvious.
                     dash=(2, 2) if held else (),
                 )
-                if self.show_labels:
-                    label = self._label_for(candidate, priority_rank, held)
-                    if label:
-                        anchor_x = 0.5 * (points[1][0] + points[2][0])
-                        anchor_y = points[1][1] - self.label_offset * self._display_scale
-                        self._canvas.create_text(
-                            anchor_x,
-                            anchor_y,
-                            text=label,
-                            fill=LABEL_COLOR,
-                            font=self.label_font,
-                            anchor="s",
-                            tags=("label",),
-                        )
-            if self.show_labels and labels:
-                self._draw_hp_only_labels(labels, candidate_boxes, scale_x, scale_y)
             self._root.update()
         except Exception:
             # A destroyed/invalid overlay must never take the capture loop down.
             self.close()
-
-    def _draw_hp_only_labels(self, labels, candidate_boxes, scale_x, scale_y) -> None:
-        """Draw the numbers of minions that have no marker of their own."""
-        for label in labels or []:
-            box = getattr(getattr(label, "minion", None), "bbox", None)
-            if box is None or len(box) != 4:
-                continue
-            try:
-                values = tuple(float(v) for v in box)
-            except (TypeError, ValueError):
-                continue
-            if not all(np.isfinite(values)):
-                continue
-            if any(_same_minion(values, candidate_box) for candidate_box in candidate_boxes):
-                continue  # this minion already carries a marker label
-            text = self._label_for(label, 0, bool(getattr(label, "held", False)))
-            if not text:
-                continue
-            anchor_x = 0.5 * (values[0] + values[2]) * scale_x
-            anchor_y = (values[1] * scale_y) - self.marker_gap * scale_y - self.label_offset * self._display_scale
-            self._canvas.create_text(
-                anchor_x,
-                anchor_y,
-                text=text,
-                fill=HP_ONLY_LABEL_COLOR,
-                font=self.label_font,
-                anchor="s",
-                tags=("label",),
-            )
-
-    def _label_for(self, candidate, priority_rank: int, held: bool) -> str:
-        """Short text above a marker: estimated HP, with '?' while the reading is held."""
-        try:
-            health = float(getattr(candidate, "health_upper_bound", 0.0))
-        except (TypeError, ValueError):
-            return ""
-        if not isfinite(health) or health <= 0:
-            return ""
-        suffix = "?" if held else ""
-        mode = getattr(self, "label_mode", "hp")
-        if mode == "percent":
-            try:
-                percent = float(getattr(candidate, "health_percent", 0.0))
-            except (TypeError, ValueError):
-                percent = 0.0
-            return f"{percent:.0f}%{suffix}"
-        if mode == "hp_damage" and self.damage is not None:
-            return f"{health:.0f}/{self.damage:.0f}{suffix}"
-        return f"{health:.0f} HP{suffix}"
 
     def close(self) -> None:
         if self._closed:
