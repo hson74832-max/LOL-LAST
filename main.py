@@ -24,6 +24,8 @@ from my_utils.modules.performance import (
     set_torch_threads,
     validate_fps,
 )
+from my_utils.modules import damage_table as damage_model
+from my_utils.modules.hp_labels import HpLabelTracker
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.modules.stability import CandidateGate
 from my_utils.modules.tracking import MinionTracker
@@ -47,6 +49,13 @@ DEFAULT_OVERLAY_FPS = 30.0
 DEFAULT_HOLD_MS = 250.0
 DEFAULT_CONFIRM_FRAMES = 2
 DEFAULT_BAR_MIN_CONFIDENCE = 0.20
+# HP numbers above the head appear once a minion is at or below this HP percent...
+DEFAULT_HP_LABEL_BELOW = 50.0
+# ...and then stay with the minion until it dies (this grace covers flicker).
+DEFAULT_HP_HOLD_MS = 1000.0
+DEFAULT_EFFECTIVE_DAMAGE = 80.0
+# Falling back on a champion's level-1 basic attack when no damage was supplied.
+DEFAULT_CHAMPION_LEVEL = 1
 
 DEFAULT_MAX_HEALTH = {
     "caster": 300.0,
@@ -148,6 +157,16 @@ def _fps(value: str) -> float:
         return validate_fps(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _percent(value: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"expected a percentage, got {value!r}") from exc
+    if not np.isfinite(number) or not 0 < number <= 100:
+        raise argparse.ArgumentTypeError(f"expected a percentage above 0 and at most 100, got {value!r}")
+    return number
 
 
 def _non_negative_float(value: str) -> float:
@@ -267,8 +286,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-effective_damage",
         dest="effective_damage",
         type=float,
-        default=80.0,
-        help="Conservative lower bound on post-mitigation basic-attack damage.",
+        default=None,
+        help=(
+            "Conservative lower bound on post-mitigation basic-attack damage. "
+            f"Defaults to {DEFAULT_EFFECTIVE_DAMAGE:.0f}, or to the estimate computed "
+            "from --champion/--level/--item when those are given."
+        ),
     )
     parser.add_argument(
         "--caster_max_hp",
@@ -370,6 +393,123 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "'hp' shows the estimated remaining HP (default), 'hp_damage' shows "
             "'HP/your damage' so the kill margin is visible, 'percent' shows the bar "
             "percentage."
+        ),
+    )
+    parser.add_argument(
+        "--hp_labels",
+        nargs="?",
+        const=True,
+        default=True,
+        type=_parse_bool,
+        help=(
+            "Show the estimated HP number above every minion that is at or below "
+            "--hp_label_below percent HP, not only above last-hittable ones "
+            "(default True). The number stays with the minion until it dies. "
+            "Disable with --no-hp_labels."
+        ),
+    )
+    parser.add_argument(
+        "--no-hp_labels",
+        dest="hp_labels",
+        action="store_false",
+        help="Only show a number above last-hittable minions (marker labels only).",
+    )
+    parser.add_argument(
+        "--hp_label_below",
+        type=_percent,
+        default=DEFAULT_HP_LABEL_BELOW,
+        help=(
+            "HP percentage at which a minion starts showing a number above its head "
+            f"(default {DEFAULT_HP_LABEL_BELOW:.0f}). Once shown, the number is kept "
+            "until the minion dies, even if a single bar reading flickers above it."
+        ),
+    )
+    parser.add_argument(
+        "--hp_hold_ms",
+        type=_non_negative_float,
+        default=DEFAULT_HP_HOLD_MS,
+        help=(
+            "Keep an HP number this many milliseconds after its minion stops being "
+            f"detected (default {DEFAULT_HP_HOLD_MS:.0f}), so a dying minion's number "
+            "does not blink out one frame early. Held numbers are drawn dimmed with "
+            "a '?'. 0 = no holding."
+        ),
+    )
+    parser.add_argument(
+        "--champion",
+        type=str,
+        default=None,
+        help=(
+            "Your champion, used to estimate --effective_damage from real base stats "
+            "(--level, --item, --bonus_ad). Example: --champion Ahri."
+        ),
+    )
+    parser.add_argument(
+        "--level",
+        type=int,
+        default=DEFAULT_CHAMPION_LEVEL,
+        help=f"Champion level for the damage estimate (default {DEFAULT_CHAMPION_LEVEL}).",
+    )
+    parser.add_argument(
+        "--item",
+        type=str,
+        default="none",
+        help=(
+            "Starting item for the damage estimate: "
+            + ", ".join(sorted(damage_model.ITEMS))
+            + " (default none)."
+        ),
+    )
+    parser.add_argument(
+        "--bonus_ad",
+        type=float,
+        default=0.0,
+        help="Extra flat attack damage from runes/items not covered by --item.",
+    )
+    parser.add_argument(
+        "--bonus_ap",
+        type=float,
+        default=0.0,
+        help="Extra flat ability power from runes/items not covered by --item.",
+    )
+    parser.add_argument(
+        "--minion_armor",
+        type=float,
+        default=damage_model.DEFAULT_MINION_ARMOR,
+        help=(
+            "Armour of the minions you last-hit, used to mitigate the damage estimate "
+            f"(default {damage_model.DEFAULT_MINION_ARMOR:.0f}: caster/melee minions; "
+            "siege minions are noticeably armoured, so raise it for those)."
+        ),
+    )
+    parser.add_argument(
+        "--ap_ratio",
+        type=float,
+        default=None,
+        help=(
+            "Optional AP ratio of the ability you last-hit with (e.g. 0.6), used to "
+            "estimate ability damage from AP. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--ability_base",
+        type=float,
+        default=None,
+        help=(
+            "Optional flat damage of that ability at its current rank, so ability "
+            "damage is base + ratio x AP instead of ratio x AP only."
+        ),
+    )
+    parser.add_argument(
+        "--damage_table",
+        nargs="*",
+        default=None,
+        metavar="CHAMPION",
+        help=(
+            "Print the base AD/AP table for levels 1-3 (all champions, or only the "
+            "named ones), including a starting item and the resulting basic-attack "
+            "damage on minions, then exit. Uses --level/--item/--bonus_ad/--bonus_ap/"
+            "--minion_armor/--ap_ratio/--ability_base."
         ),
     )
     parser.add_argument(
@@ -531,6 +671,7 @@ def process_frame(
     gate: CandidateGate | None = None,
     pipeline_stats: dict | None = None,
     tracker: MinionTracker | None = None,
+    hp_tracker: HpLabelTracker | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Evaluate a single frame and return (prioritized_last_hit_candidates, visualized_frame)."""
     detection_result = detector(captured_frame.image)
@@ -541,6 +682,13 @@ def process_frame(
         excluded_regions=captured_frame.excluded_regions,
     )
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    # HP numbers are independent of eligibility: they appear as soon as a minion is
+    # low enough and then stay with it until it dies.
+    labels = (
+        hp_tracker.update(matched_minions, now=captured_frame.captured_at)
+        if hp_tracker is not None
+        else []
+    )
     if pipeline_stats is not None:
         pipeline_stats.update(
             matched=len(matched_minions),
@@ -561,8 +709,9 @@ def process_frame(
     if pipeline_stats is not None:
         pipeline_stats["kept"] = len(candidates)
         pipeline_stats["held"] = sum(1 for c in candidates if c.held)
+        pipeline_stats["hp_labels"] = len(labels)
     visualized = (
-        annotator(candidates=candidates, img=captured_frame.image)
+        annotator(candidates=candidates, img=captured_frame.image, labels=labels)
         if annotator is not None
         else None
     )
@@ -594,6 +743,7 @@ def evaluate_with_latest_detections(
     allow_stale_frame_fallback: bool = False,
     pipeline_stats: dict | None = None,
     tracker: MinionTracker | None = None,
+    hp_tracker: HpLabelTracker | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Re-evaluate health bars on the live frame using the newest detector boxes.
 
@@ -602,8 +752,10 @@ def evaluate_with_latest_detections(
     minion that died, or another minion entirely, while the camera scrolls.
     """
     def _empty():
+        if hp_tracker is not None:
+            hp_tracker.reset()
         visualized = (
-            annotator(candidates=[], img=captured_frame.image, copy=False)
+            annotator(candidates=[], img=captured_frame.image, copy=False, labels=[])
             if annotator is not None
             else None
         )
@@ -644,6 +796,11 @@ def evaluate_with_latest_detections(
         )
 
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    labels = (
+        hp_tracker.update(matched_minions, now=captured_frame.captured_at)
+        if hp_tracker is not None
+        else []
+    )
     if pipeline_stats is not None:
         pipeline_stats.update(
             matched=len(matched_minions),
@@ -666,10 +823,11 @@ def evaluate_with_latest_detections(
     if pipeline_stats is not None:
         pipeline_stats["kept"] = len(candidates)
         pipeline_stats["held"] = sum(1 for c in candidates if c.held)
+        pipeline_stats["hp_labels"] = len(labels)
     # The live frame was just handed to the detection worker; annotating it in
     # place would let YOLOv9 read half-drawn boxes, so always render on a copy.
     visualized = (
-        annotator(candidates=candidates, img=captured_frame.image, copy=True)
+        annotator(candidates=candidates, img=captured_frame.image, copy=True, labels=labels)
         if annotator is not None
         else None
     )
@@ -722,9 +880,69 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--confirm_frames must be at least 1")
     if not 0 < args.min_bar_confidence <= 1:
         parser.error("--min_bar_confidence must be greater than 0 and at most 1")
+    if not 0 < args.hp_label_below <= 100:
+        parser.error("--hp_label_below must be greater than 0 and at most 100")
+    if not 1 <= args.level <= 18:
+        parser.error("--level must be between 1 and 18")
+
+    if args.damage_table is not None:
+        try:
+            print(
+                damage_model.format_table(
+                    args.damage_table,
+                    item=args.item,
+                    bonus_ad=args.bonus_ad,
+                    bonus_ap=args.bonus_ap,
+                    minion_armor=args.minion_armor,
+                    ap_ratio=args.ap_ratio,
+                    ability_base=args.ability_base,
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        return 0
+
+    # --effective_damage is the one value the companion cannot read from the
+    # screen.  It is either given explicitly or estimated from the champion.
+    effective_damage = args.effective_damage
+    estimate = None
+    if args.champion is not None:
+        try:
+            estimate = damage_model.estimate_damage(
+                args.champion,
+                level=args.level,
+                item=args.item,
+                bonus_ad=args.bonus_ad,
+                bonus_ap=args.bonus_ap,
+                minion_armor=args.minion_armor,
+                ap_ratio=args.ap_ratio,
+                ability_base=args.ability_base,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if effective_damage is None:
+            effective_damage = estimate.effective_damage
+    if effective_damage is None:
+        effective_damage = DEFAULT_EFFECTIVE_DAMAGE
+
+    # Report the estimate before the (slow) model load so it shows up immediately.
+    if estimate is not None:
+        print(f"[INFO] Damage estimate: {estimate.describe()}.")
+        if args.effective_damage is None:
+            print(
+                f"[INFO] Using --effective_damage {effective_damage:.1f} from that estimate "
+                f"({damage_model.describe_item(estimate.item)}, level {estimate.level}, "
+                f"minion armour {args.minion_armor:.0f}); override it with --effective_damage."
+            )
+        elif abs(args.effective_damage - estimate.effective_damage) > 0.5:
+            print(
+                f"[NOTE] Your --effective_damage {args.effective_damage:.1f} differs from the "
+                f"{estimate.effective_damage:.1f} this champion/level/item predicts; the "
+                "explicit value wins."
+            )
 
     settings = LastHitSettings(
-        effective_damage=args.effective_damage,
+        effective_damage=effective_damage,
         max_health={
             "caster": args.caster_max_hp,
             "melee": args.melee_max_hp,
@@ -758,6 +976,24 @@ def main(argv: list[str] | None = None) -> int:
     advisor = LastHitAdvisor(settings)
     gate = CandidateGate(confirm_frames=args.confirm_frames)
     tracker = MinionTracker(hold_ms=args.hold_ms)
+    hp_tracker = (
+        HpLabelTracker(
+            max_health=settings.max_health,
+            threshold_percent=args.hp_label_below,
+            hold_ms=args.hp_hold_ms,
+            health_margin=settings.health_margin,
+            min_confidence=settings.min_confidence,
+        )
+        if args.hp_labels
+        else None
+    )
+    if hp_tracker is not None:
+        print(
+            f"[INFO] HP numbers appear on minions at or below {args.hp_label_below:.0f}% HP "
+            f"and stay until the minion dies (held {args.hp_hold_ms:.0f} ms after a lost reading)."
+        )
+    else:
+        print("[INFO] HP numbers are only drawn above last-hittable minions.")
     print(
         f"[INFO] Markers require {args.confirm_frames} consecutive frame(s); detector boxes "
         f"older than {args.max_detection_age * 1000:.0f} ms are ignored; "
@@ -872,6 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
                         allow_stale_frame_fallback=args.stale_frame_fallback,
                         pipeline_stats=pipeline_stats,
                         tracker=tracker,
+                        hp_tracker=hp_tracker,
                     )
                 else:
                     candidates, visualized = process_frame(
@@ -884,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
                         gate=gate,
                         pipeline_stats=pipeline_stats,
                         tracker=tracker,
+                        hp_tracker=hp_tracker,
                     )
 
                 timings.add("evaluate", time.perf_counter() - evaluate_started)
@@ -930,7 +1168,11 @@ def main(argv: list[str] | None = None) -> int:
 
                 if overlay is not None:
                     with timings.measure("overlay"):
-                        overlay.render(candidates, captured.image.shape)
+                        overlay.render(
+                            candidates,
+                            captured.image.shape,
+                            labels=hp_tracker.last_labels if hp_tracker is not None else None,
+                        )
                     if overlay.closed:
                         overlay_failed = True
                         overlay = None

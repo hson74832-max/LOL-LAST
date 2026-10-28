@@ -22,6 +22,32 @@ from my_utils.modules.last_hitter import LastHitCandidate
 from my_utils.modules.stability import _center_and_size
 
 
+def match_by_proximity(track_positions, measured_positions, match_ratio: float = 0.75):
+    """Greedy nearest-neighbour matching, closest pairs first.
+
+    Both arguments are sequences of ``(x, y, size)`` tuples.  Returns a mapping
+    ``measured_index -> track_index``.  Matching closest pairs first keeps two
+    neighbouring minions in a wave from being merged into a single track.
+    """
+    pairs = []
+    for track_index, (track_x, track_y, track_size) in enumerate(track_positions):
+        limit = max(4.0, match_ratio * track_size)
+        for measured_index, (x, y, _) in enumerate(measured_positions):
+            distance = hypot(x - track_x, y - track_y)
+            if distance <= limit:
+                pairs.append((distance, track_index, measured_index))
+    pairs.sort()
+
+    matched_measurements: dict[int, int] = {}
+    for _, track_index, measured_index in pairs:
+        if track_index in matched_measurements.values():
+            continue
+        if measured_index in matched_measurements:
+            continue
+        matched_measurements[measured_index] = track_index
+    return matched_measurements
+
+
 class MinionTracker:
     """Attach identities to confirmed candidates and hold them briefly when lost."""
 
@@ -56,22 +82,13 @@ class MinionTracker:
             if geometry is not None:
                 measured.append((index, candidate, geometry))
 
-        pairs = []
-        for track_index, track in enumerate(self._tracks):
-            limit = max(4.0, self.match_ratio * track["size"])
-            for measured_index, (_, _, (x, y, size)) in enumerate(measured):
-                distance = hypot(x - track["x"], y - track["y"])
-                if distance <= limit:
-                    pairs.append((distance, track_index, measured_index))
-        pairs.sort()
-
-        matched_tracks: dict[int, int] = {}
-        matched_measurements: dict[int, int] = {}
-        for distance, track_index, measured_index in pairs:
-            if track_index in matched_tracks or measured_index in matched_measurements:
-                continue
-            matched_tracks[track_index] = measured_index
-            matched_measurements[measured_index] = track_index
+        matched_measurements = match_by_proximity(
+            [(track["x"], track["y"], track["size"]) for track in self._tracks],
+            [geometry for _, _, geometry in measured],
+            self.match_ratio,
+        )
+        matched_tracks = {track_index: measured_index
+                          for measured_index, track_index in matched_measurements.items()}
 
         # Refresh the tracks that are still visible, in detection order.
         visible: list[LastHitCandidate] = []

@@ -5,7 +5,7 @@ This repository provides a **read-only, non-injection** visual companion for ide
 
 ## Key Guarantees
 - **Zero Injection**: Performs **no** game process/memory reading or DLL injection, and **no** synthetic mouse/keyboard input (`pynput` removed).
-- **Only Last-Hittable Minions Shown**: Minions whose conservative upper-bound HP exceeds your configured effective attack damage—or whose detection/health-bar reading is ambiguous, clipped, or low-confidence—are excluded and never rendered.
+- **Only Last-Hittable Minions Marked**: Minions whose conservative upper-bound HP exceeds your configured effective attack damage—or whose detection/health-bar reading is ambiguous, clipped, or low-confidence—never get a marker triangle. (Their HP **number** can still be shown by the separate, opt-out label layer described under [HP numbers above minions](#hp-numbers-above-minions-shown-early-kept-until-the-minion-dies); turn it off with `--no-hp_labels`.)
 - **Minion Prioritization Preserved**: Eligible last-hittable minions are ranked by distance to the player anchor (`#1` nearest priority target highlighted in yellow, `#2+` secondary last-hittable minions in green), with deterministic tie-breaking by remaining HP upper bound and bounding box.
 - **Markers On Your Game Screen**: The prioritized minions are drawn by a **click-through, always-on-top overlay** directly on the captured desktop, not just inside the companion preview window. The overlay is a separate top-most Tk window: it never reads the game process, never sends input, and never takes keyboard focus (`--no-overlay` disables it).
 
@@ -93,37 +93,69 @@ Check the first lines of console output, they state the device explicitly, e.g.:
 [INFO] Detector initialized on device=privateuseone:0 [DirectML] (fp16=False, imgsz=(640, 640))
 ```
 
-## HP numbers above minions, and keeping a marker until the minion dies
-Every marker now carries the **estimated remaining HP** of that minion, on the overlay and in the preview window:
+## HP numbers above minions (shown early, kept until the minion dies)
+Every minion that drops to **50 % HP or below** gets its estimated remaining HP drawn above its head — on the overlay *and* in the preview window — and that number **stays with the minion until it dies**, long after the minion became last-hittable:
 
-| Flag | Default | Result above a marker |
+```
+       60 HP          <- minion at 40 %: number only, no marker triangle yet
+         ▼
+      58 HP ▼        <- last-hittable: triangle marker + number
+```
+
+| Flag | Default | Effect |
 | --- | --- | --- |
-| `--overlay_labels` / `--no-overlay_labels` | on | show/hide the number |
+| `--hp_labels` / `--no-hp_labels` | on | Show the HP number above every minion below the threshold, not only above last-hittable ones |
+| `--hp_label_below` | `50` | HP percentage at which a number starts appearing |
+| `--hp_hold_ms` | `1000` | Keep the number this long after the minion stops being detected |
+| `--overlay_labels` / `--no-overlay_labels` | on | Show/hide the whole number layer (overlay only) |
 | `--overlay_label_mode hp` | ✔ | `58 HP` |
 | `--overlay_label_mode hp_damage` | | `58/80` — remaining HP vs. your damage, i.e. the kill margin |
 | `--overlay_label_mode percent` | | `19%` |
-| `--hold_ms` | `250` | keep a confirmed marker this long after the minion stops being detected |
+| `--hold_ms` | `250` | How long a *marker* (triangle) survives a lost reading |
 
-Held markers keep the **last position and last HP reading** and are drawn dimmed/dashed with a `?` (`58 HP?`) so a stale reading is never mistaken for a live one. They are never invented: only minions that were already confirmed get held, hold time is capped by `--hold_ms` (set `0` to disable), and the marker disappears as soon as the grace period ends — so a dead minion never keeps a marker for more than `--hold_ms`.
+How the "keep it until it dies" rule works without ever inventing data:
+
+- The number is created the first time a minion is seen at or below `--hp_label_below`.
+- It is then **sticky**: a single flickering bar reading above the threshold (a misread, an overlapping bar, a shield effect) no longer makes it disappear, because the minion is still the same minion.
+- When the minion stops being detected at all, the number is held for `--hp_hold_ms` and rendered dimmed with a trailing `?` (`58 HP?`), so a stale reading is obvious. A dead minion disappears from the capture, so its number is gone as soon as that grace period ends.
+- Unlike markers, numbers do not require `--confirm_frames`, so the number is there *before* the minion is killable — that is the point: it tells you which minion is next.
+
+Numbers are never duplicated: a minion that already carries a marker triangle is labelled once, by its marker.
 
 Remaining HP is computed as `health_fraction × max HP of that minion type` using `--caster_max_hp` / `--melee_max_hp` / `--siege_max_hp`, and it is deliberately an **upper bound**. That is why the label is an estimate: a minion showing `58 HP` with `--effective_damage 80` is safe to hit, one showing `84 HP` is not marked at all.
 
-## Why the companion cannot read your AD/AP
-The champion's attack damage / ability power is **not** visible on screen (the scoreboard shows items and KDA, not AD/AP), and reading it would require reading the game's memory or process — exactly what this project guarantees it never does (`Zero Injection` above). There is no reliable OCR path either: the value changes with level, items, runes and buffs, and never appears as a number in the HUD.
-
-So the damage value is an explicit, conservative input:
+## Where the damage number comes from (champion table)
+The companion cannot *read* your damage: AD/AP is not in the HUD (the scoreboard shows items and KDA), and reading it would mean reading game memory — exactly what this project never does (`Zero Injection` above). It can, however, **compute** it from stats you already know: your champion, your level and your starting item.
 
 ```bat
-:: your post-mitigation basic-attack damage on minions (AD + on-hit, minus minion armor)
-run.bat --effective_damage 80 --overlay_label_mode hp_damage
+:: let the tool derive --effective_damage from the champion table
+run.bat --champion Ahri --level 2 --item doran_ring
+
+:: or print the table for a few champions and copy the value yourself
+run.bat --damage_table Ahri Lux Aatrox
 ```
 
-How to pick it quickly:
-1. Hit a minion once and watch the number on `--debug` (or the overlay) before/after — the drop is your effective damage.
-2. Or take your in-game AD and subtract ~0–10 for minion armor; on-hit effects (Sheen, Kraken, Doran's) add to it.
-3. Abilities are intentionally ignored: last-hit timing from a basic attack is what this tool predicts.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--champion` | unset | Your champion; enables the damage estimate (fuzzy names: `mundo`, `Dr. Mundo`, `wukong`, …) |
+| `--level` | `1` | Champion level used for the level scaling (1–18) |
+| `--item` | `none` | Starting item: `doran_blade` (+8 AD), `long_sword` (+10 AD), `cull` (+7 AD), `doran_ring` (+15 AP), `dark_seal` (+15 AP), `amplifying_tome` (+20 AP) |
+| `--bonus_ad`, `--bonus_ap` | `0` | Extra flat AD/AP (runes, shards, other items) |
+| `--minion_armor` | `0` | Armour of the minion you last-hit (caster/melee are unarmoured; use ~`30` for siege) |
+| `--ap_ratio`, `--ability_base` | unset | Opt-in ability model: damage = `ability_base + ap_ratio × AP` |
+| `--damage_table [CHAMPION…]` | — | Print the level 1/2/3 table (all champions when no name is given) and exit |
 
-If you set `--effective_damage` too high, non-killable minions get marked; the conservative upper-bound HP reading makes that unlikely but not impossible, so keep it at what you *actually* deal, not your theoretical maximum.
+What the estimate does:
+
+- **Basic attack damage** = `base AD + AD growth × level factor + item/runes`, then mitigated by `100 / (100 + --minion_armor)`.
+- Level scaling uses Riot's formula: `value(n) = base + growth × (n−1) × (0.7025 + 0.0175 × (n−1))`, i.e. level 2 is worth 72 % of a growth step and level 3 147.5 %.
+- **AP never changes a basic attack.** Every champion has 0 base AP — AP only ever comes from items/runes/buffs and only feeds abilities, so `--ap_ratio`/`--ability_base` are opt-in and the result is only used when it is *lower* than a basic attack (the damage value must be a number you can rely on).
+- An explicit `--effective_damage` always wins over the estimate (a `[NOTE]` tells you when they disagree).
+- Abilities' rank damage, on-hit effects (Sheen, Kraken, Doran's passive), runes, buffs and crit are **not** modelled. The estimate is a starting point, not a simulation.
+
+The full table for all champions at levels 1–3 (base AD, AD with a starting item, one basic attack against a minion, autos needed for a 300 HP caster) lives in **[docs/champion_damage_table.md](docs/champion_damage_table.md)**; it is generated from Riot Data Dragon base stats (`data/champion_base_stats.json`, patch 15.15.1) by `tools/build_champion_stats.py` + `tools/build_damage_doc.py`. No network access happens at runtime.
+
+Sanity check without any of this: hit a minion once and watch the number drop — that difference is your real effective damage, and you can pass it as `--effective_damage` directly.
 
 ## Missing health bars no longer hide minions
 YOLOv9's `*_health_bar` class is the weakest link in a real fight: reports of 8–9 detected minion bodies with 0–2 detected bars are common, and without a bar a minion can never be associated, so **no marker can be drawn at all**.
@@ -176,7 +208,7 @@ Confusing or delayed markers come from two places: **stale detections** (boxes f
 | `--min_confidence` | `0.25` | Minimum confidence for minion bodies. Raise to `0.4`–`0.5` to suppress phantom boxes. |
 | `--stale_frame_fallback` | off | Legacy behaviour: when the live frame yields no match, re-run association on the previous frame. Off because that is exactly what produces delayed markers on dead minions. |
 
-A marker disappears on the **first** frame a candidate is no longer detected — there is no hold time and no memory of dead minions. When detections are older than `--max_detection_age`, the companion prints a one-time warning naming the fix (GPU install or a larger age limit) instead of showing wrong markers.
+A marker is dropped as soon as a candidate is no longer detected — the short `--hold_ms` grace (default `250` ms) exists only so a flickering health bar cannot make a live minion blink away, and it is capped, so a dead minion never keeps a marker for longer than that. HP *numbers* are a separate layer with their own, longer grace (`--hp_hold_ms`); see [HP numbers above minions](#hp-numbers-above-minions-shown-early-kept-until-the-minion-dies). When detections are older than `--max_detection_age`, the companion prints a one-time warning naming the fix (GPU install or a larger age limit) instead of showing wrong markers.
 
 Strictest useful setup on a mid-range GPU:
 ```bat
@@ -221,6 +253,16 @@ Overlay-only mode (markers over the game, no preview window):
 python main.py --monitor_idx 1 --no-visualize --minion_color red --H 720 --W 1280 --effective_damage 80
 ```
 
+Let the champion table pick the damage number, and label every minion below 50 % HP:
+```bash
+python main.py --monitor_idx 1 --champion Ahri --level 2 --item doran_ring --hp_label_below 50
+```
+
+Print the damage table for a few champions (no game, no GPU, no weights needed):
+```bash
+python main.py --damage_table Ahri Lux Aatrox --item doran_blade
+```
+
 Inspect available monitor indices:
 ```bash
 python main.py --list-monitors
@@ -235,6 +277,7 @@ Diagnostics / setup:
 | `run.bat --check-devices` | Which backend (CUDA / MPS / DirectML / CPU) is usable and how to fix it |
 | `run.bat --list-monitors` | Monitor indices for `--monitor_idx` |
 | `run.bat --debug` | Per-frame diagnostics + `frames/debug/latest.png` + speed tips |
+| `run.bat --damage_table Ahri Lux` | Champion base-AD table for levels 1-3 with a starting item and the resulting damage on minions |
 | `install_requirements.bat --directml` | Install AMD/Intel GPU support (torch-directml) |
 | `install_requirements.bat --system` | Install into the system Python instead of `.venv` |
 
@@ -244,6 +287,7 @@ Display:
 | `--visualize` / `--no-visualize` | Capture preview window (markers drawn in it) |
 | `--overlay` / `--no-overlay` | Click-through markers on the game screen |
 | `--overlay_fps`, `--overlay_gap` | Overlay redraw rate, marker distance above the minion |
+| `--hp_labels` / `--no-hp_labels`, `--hp_label_below`, `--hp_hold_ms` | Numbers above every minion at or below the HP threshold, kept until it dies |
 | `--preview_W`, `--preview_H`, `--mask_preview` | Preview window size, mask it out of the capture |
 | `--monitor_idx` | Which monitor to capture |
 
@@ -256,6 +300,9 @@ Detection / strictness:
 Last-hit maths:
 `--effective_damage`, `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`, `--health_margin`, `--minion_color`, `--player_anchor`, `--max_distance`.
 
+Damage estimate (champion table):
+`--champion`, `--level`, `--item`, `--bonus_ad`, `--bonus_ap`, `--minion_armor`, `--ap_ratio`, `--ability_base`, `--damage_table`.
+
 ### Parameters
 - `--monitor_idx`: Monitor index to capture screenshots from.
 - `--visualize` / `--no-visualize`: Enable or disable the read-only preview window.
@@ -265,7 +312,13 @@ Last-hit maths:
 - `--sync`: Run capture and inference synchronously instead of the default low-latency asynchronous pipeline.
 - `--overlay` / `--no-overlay`: Enable or disable the click-through desktop overlay that draws last-hit markers on the game screen (default enabled; automatically skipped with a warning if the Python build has no `tkinter`).
 - `--overlay_gap`: Distance in frame pixels between a minion's bounding box top and its overlay marker (default `16`).
-- `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage.
+- `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage (default `80`, or the estimate from `--champion`/`--level`/`--item` when those are given).
+- `--champion`, `--level`, `--item`, `--bonus_ad`, `--bonus_ap`, `--minion_armor`: Compute `--effective_damage` from real base stats (see [the champion table](#where-the-damage-number-comes-from-champion-table)).
+- `--ap_ratio`, `--ability_base`: Optional ability model used only when it predicts *less* damage than a basic attack.
+- `--damage_table`: Print the level 1/2/3 table for all champions (or the named ones) and exit.
+- `--hp_labels` / `--no-hp_labels`: Numbers above every minion at or below `--hp_label_below` (default on).
+- `--hp_label_below`: HP percentage at which a number starts appearing (default `50`).
+- `--hp_hold_ms`: Keep a number this long after its minion is lost (default `1000`; `0` disables).
 - `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`: Conservative upper bounds on minion maximum HP.
 - `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.0`).
 - `--min_confidence`: Minimum detection confidence for minion bodies (default `0.25`).
