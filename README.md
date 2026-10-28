@@ -1,8 +1,7 @@
-# League of Legends Last Hit Companion (Non-Injection)
+# League of Legends Last Hit (Non-Injection)
 
 This repository provides a **read-only, non-injection** visual companion for identifying and prioritizing last-hittable minions in League of Legends from desktop screen capture.
 
-![](figures/futuristic.png)
 
 ## Key Guarantees
 - **Zero Injection**: Performs **no** game process/memory reading or DLL injection, and **no** synthetic mouse/keyboard input (`pynput` removed).
