@@ -1,6 +1,12 @@
 """YOLOv9 minion and health-bar detector wrapper."""
 
+from contextlib import contextmanager
+import os
+import pathlib
 from pathlib import Path
+import re
+import shutil
+import subprocess
 import sys
 
 import numpy as np
@@ -9,6 +15,13 @@ from my_utils.data_structures.labels import normalize_label
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_WEIGHTS_PATH = PROJECT_ROOT / "weights" / "best.pt"
+GDRIVE_WEIGHTS_ID = "135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo"
+GDRIVE_WEIGHTS_URL = (
+    f"https://drive.google.com/file/d/{GDRIVE_WEIGHTS_ID}/view?usp=share_link"
+)
+MIN_VALID_WEIGHTS_BYTES = 1_000_000  # Valid YOLOv9 .pt checkpoints are multiple MBs
+
 MINION_LABELS = {
     "red": frozenset({"red caster minion", "red melee minion", "red siege minion"}),
     "blue": frozenset({"blue caster minion", "blue melee minion", "blue siege minion"}),
@@ -33,21 +46,234 @@ def select_default_device(torch_module) -> str:
     return "cpu"
 
 
+def _is_valid_checkpoint_file(path: Path) -> bool:
+    """Return True if path exists, is non-empty, and is not an HTML error page."""
+    try:
+        if not path.is_file() or path.stat().st_size < 1024:
+            return False
+        with path.open("rb") as fh:
+            header = fh.read(64).lstrip()
+        if header.lower().startswith((b"<!doctype html", b"<html")):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _is_default_weight_request(weight_path: Path) -> bool:
+    normalized = weight_path.as_posix().lstrip("./")
+    return normalized in {"weights/best.pt", "best.pt"} or (
+        weight_path.resolve(strict=False) == DEFAULT_WEIGHTS_PATH.resolve(strict=False)
+    )
+
+
+def _find_local_weight_candidates(weight_path: Path) -> Path | None:
+    """Search explicit path, repo-relative path, and common Windows download locations."""
+    direct_candidates = [weight_path]
+    if not weight_path.is_absolute():
+        direct_candidates.append(PROJECT_ROOT / weight_path)
+
+    for candidate in direct_candidates:
+        if candidate.is_file():
+            return candidate
+
+    if not _is_default_weight_request(weight_path):
+        return None
+
+    fallback_candidates = [
+        DEFAULT_WEIGHTS_PATH,
+        PROJECT_ROOT / "weights" / "best.pt.pt",
+        PROJECT_ROOT / "best.pt",
+        PROJECT_ROOT / "best.pt.pt",
+    ]
+    weights_dir = PROJECT_ROOT / "weights"
+    if weights_dir.is_dir():
+        pt_files = sorted(p for p in weights_dir.glob("*.pt") if p.is_file())
+        if len(pt_files) == 1:
+            fallback_candidates.append(pt_files[0])
+
+    for candidate in fallback_candidates:
+        if _is_valid_checkpoint_file(candidate):
+            if candidate != DEFAULT_WEIGHTS_PATH:
+                DEFAULT_WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(candidate, DEFAULT_WEIGHTS_PATH)
+                    return DEFAULT_WEIGHTS_PATH
+                except OSError:
+                    return candidate
+            return candidate
+
+    downloads_dir = Path.home() / "Downloads"
+    for name in ("best.pt", "best.pt.pt"):
+        downloaded = downloads_dir / name
+        if _is_valid_checkpoint_file(downloaded):
+            DEFAULT_WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(downloaded, DEFAULT_WEIGHTS_PATH)
+                return DEFAULT_WEIGHTS_PATH
+            except OSError:
+                return downloaded
+
+    return None
+
+
+def _download_from_gdrive_requests(file_id: str, destination: Path) -> bool:
+    """Fallback downloader using requests when gdown is not installed."""
+    import requests
+
+    session = requests.Session()
+    url = "https://drive.usercontent.google.com/download"
+    params = {"id": file_id, "export": "download", "confirm": "t"}
+    response = session.get(url, params=params, stream=True, timeout=60)
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "text/html" in content_type:
+        html = response.text
+        action_match = re.search(r'<form[^>]+action="([^"]+)"', html)
+        form_url = action_match.group(1) if action_match else url
+        form_params = dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', html))
+        if not form_params:
+            form_params = params
+        response = session.get(form_url, params=form_params, stream=True, timeout=60)
+        response.raise_for_status()
+
+    tmp_path = destination.with_suffix(".pt.part")
+    try:
+        with tmp_path.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+        if not _is_valid_checkpoint_file(tmp_path) or tmp_path.stat().st_size < MIN_VALID_WEIGHTS_BYTES:
+            tmp_path.unlink(missing_ok=True)
+            return False
+        tmp_path.replace(destination)
+        return True
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def ensure_default_weights(destination: Path = DEFAULT_WEIGHTS_PATH) -> Path:
+    """Ensure the default YOLOv9 weights exist locally, downloading them if needed."""
+    destination = Path(destination)
+    existing = _find_local_weight_candidates(destination)
+    if existing is not None:
+        return existing
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_suffix(".pt.part")
+    print(f"[INFO] Model weights not found at {destination}. Downloading weights/best.pt ...")
+
+    try:
+        import gdown  # type: ignore[import-not-found]
+
+        downloaded = gdown.download(
+            id=GDRIVE_WEIGHTS_ID,
+            output=str(tmp_path),
+            quiet=False,
+            fuzzy=True,
+        )
+        if downloaded and _is_valid_checkpoint_file(tmp_path) and tmp_path.stat().st_size >= MIN_VALID_WEIGHTS_BYTES:
+            tmp_path.replace(destination)
+            return destination
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+
+    try:
+        if _download_from_gdrive_requests(GDRIVE_WEIGHTS_ID, destination):
+            return destination
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"model weights not found at {destination} and automatic download failed ({exc}).\n"
+            f"Please download best.pt from:\n  {GDRIVE_WEIGHTS_URL}\n"
+            f"and save it to:\n  {destination}"
+        ) from exc
+
+    raise FileNotFoundError(
+        f"model weights not found at {destination} and automatic download did not return a valid checkpoint.\n"
+        f"Please download best.pt from:\n  {GDRIVE_WEIGHTS_URL}\n"
+        f"and save it to:\n  {destination}"
+    )
+
+
+def resolve_weight_path(
+    weight_path: str | Path = DEFAULT_WEIGHTS_PATH,
+    auto_download: bool = True,
+) -> Path:
+    candidate_path = Path(weight_path)
+    found = _find_local_weight_candidates(candidate_path)
+    if found is not None:
+        return found
+
+    if auto_download and _is_default_weight_request(candidate_path):
+        return ensure_default_weights(DEFAULT_WEIGHTS_PATH)
+
+    expected = (
+        candidate_path
+        if candidate_path.is_absolute()
+        else (PROJECT_ROOT / candidate_path)
+    )
+    raise FileNotFoundError(
+        f"model weights not found: {expected}\n"
+        f"Download the trained YOLOv9 weights from:\n  {GDRIVE_WEIGHTS_URL}\n"
+        f"and place them at:\n  {DEFAULT_WEIGHTS_PATH}"
+    )
+
+
+@contextmanager
+def _torch_load_compat(torch_module):
+    """Ensure cross-platform PosixPath unpickling on Windows and weights_only=False on PyTorch 2.6+."""
+    orig_torch_load = torch_module.load
+    orig_posix_path = getattr(pathlib, "PosixPath", None)
+
+    def _compat_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return orig_torch_load(*args, **kwargs)
+
+    torch_module.load = _compat_load
+    if os.name == "nt" and orig_posix_path is not None:
+        pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc,assignment]
+    try:
+        yield
+    finally:
+        torch_module.load = orig_torch_load
+        if os.name == "nt" and orig_posix_path is not None:
+            pathlib.PosixPath = orig_posix_path  # type: ignore[misc,assignment]
+
+
 def _load_yolov9_symbols():
     yolov9_dir = PROJECT_ROOT / "yolov9"
+    if not (yolov9_dir / "models" / "common.py").is_file() and shutil.which("git"):
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/WongKinYiu/yolov9.git",
+                    str(yolov9_dir),
+                ],
+                check=True,
+            )
+        except Exception:
+            pass
+
     if yolov9_dir.is_dir() and str(yolov9_dir) not in sys.path:
         sys.path.insert(0, str(yolov9_dir))
     if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.append(str(PROJECT_ROOT))
 
     try:
-        from yolov9.models.common import DetectMultiBackend
-        from yolov9.utils.augmentations import letterbox
-        from yolov9.utils.general import non_max_suppression, scale_boxes
-    except ImportError:
         from models.common import DetectMultiBackend
         from utils.augmentations import letterbox
         from utils.general import non_max_suppression, scale_boxes
+    except ImportError:
+        from yolov9.models.common import DetectMultiBackend
+        from yolov9.utils.augmentations import letterbox
+        from yolov9.utils.general import non_max_suppression, scale_boxes
 
     return DetectMultiBackend, letterbox, non_max_suppression, scale_boxes
 
@@ -63,7 +289,7 @@ def _unwrap_predictions(raw_pred):
 class Detector:
     def __init__(
         self,
-        weight_path: str | Path = PROJECT_ROOT / "weights/best.pt",
+        weight_path: str | Path = DEFAULT_WEIGHTS_PATH,
         device: str | None = None,
         dnn: bool = False,
         half: bool = False,
@@ -71,6 +297,7 @@ class Detector:
         conf_thres: float = 0.25,
         iou_thres: float = 0.45,
         backend=None,
+        auto_download: bool = True,
     ):
         if not 0 < float(conf_thres) <= 1:
             raise ValueError("confidence threshold must be in (0, 1]")
@@ -89,14 +316,19 @@ class Detector:
         else:
             import torch
 
-            weight_path = Path(weight_path)
-            if not weight_path.is_file():
-                raise FileNotFoundError(f"model weights not found: {weight_path}")
-            resolved_device = device or select_default_device(torch)
-            DetectMultiBackend, letterbox, non_max_suppression, scale_boxes = _load_yolov9_symbols()
-            self.model = DetectMultiBackend(
-                str(weight_path), device=resolved_device, dnn=dnn, fp16=half
+            resolved_weight_path = resolve_weight_path(
+                weight_path, auto_download=auto_download
             )
+            resolved_device_str = device or select_default_device(torch)
+            resolved_device = torch.device(resolved_device_str)
+            DetectMultiBackend, letterbox, non_max_suppression, scale_boxes = _load_yolov9_symbols()
+            with _torch_load_compat(torch):
+                self.model = DetectMultiBackend(
+                    str(resolved_weight_path),
+                    device=resolved_device,
+                    dnn=dnn,
+                    fp16=half,
+                )
             self._letterbox = letterbox
             self._nms = non_max_suppression
             self._scale_boxes = scale_boxes

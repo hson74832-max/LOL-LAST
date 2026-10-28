@@ -11,7 +11,7 @@ import cv2
 
 from my_utils.loaders.frame_loader import CapturedFrame, FrameLoader
 from my_utils.modules.algorithms import ObjectAssociator
-from my_utils.modules.detector import Detector
+from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.visualizers.annotator import AIAnnotator
 
@@ -84,6 +84,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--effective_damage",
+        "--effective-damage",
+        "-effective_damage",
+        dest="effective_damage",
         type=float,
         default=80.0,
         help="Conservative lower bound on post-mitigation basic-attack damage.",
@@ -135,8 +138,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--weights",
         type=str,
-        default="./weights/best.pt",
-        help="Path to YOLOv9 weights file.",
+        default=str(DEFAULT_WEIGHTS_PATH),
+        help="Path to YOLOv9 weights file (auto-downloaded if missing).",
     )
     parser.add_argument(
         "--device",

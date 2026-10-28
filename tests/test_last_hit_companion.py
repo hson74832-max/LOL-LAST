@@ -20,7 +20,13 @@ from my_utils.loaders.frame_loader import (
     resize_image,
 )
 from my_utils.modules.algorithms import ObjectAssociator
-from my_utils.modules.detector import Detector, _unwrap_predictions
+from my_utils.modules.detector import (
+    Detector,
+    _is_valid_checkpoint_file,
+    _torch_load_compat,
+    _unwrap_predictions,
+    resolve_weight_path,
+)
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.modules.utils.health_bar_utils import HealthBarUtils
 from my_utils.visualizers.annotator import (
@@ -399,3 +405,48 @@ def test_installer_scripts_and_requirements_file():
     install_sh = (REPO_ROOT / "install_requirements.sh").read_text(encoding="utf-8")
     assert "pip install -r requirements.txt" in install_sh
     assert "https://github.com/WongKinYiu/yolov9.git" in install_sh
+    assert "ensure_default_weights" in install_bat
+    assert "ensure_default_weights" in install_sh
+
+
+def test_weight_resolution_and_windows_torch_compat(tmp_path, monkeypatch):
+    import my_utils.modules.detector as detector_mod
+
+    # 1. Valid vs invalid checkpoint header checks
+    html_file = tmp_path / "error.pt"
+    html_file.write_bytes(b"<!DOCTYPE html><html>Error</html>" + b"0" * 2048)
+    assert not _is_valid_checkpoint_file(html_file)
+
+    valid_file = tmp_path / "best.pt"
+    valid_file.write_bytes(b"PK\x03\x04" + b"\x00" * 4096)
+    assert _is_valid_checkpoint_file(valid_file)
+
+    # 2. Fallback discovery when best.pt is placed in project root or double-extension best.pt.pt
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    fake_default = fake_root / "weights" / "best.pt"
+    monkeypatch.setattr(detector_mod, "PROJECT_ROOT", fake_root)
+    monkeypatch.setattr(detector_mod, "DEFAULT_WEIGHTS_PATH", fake_default)
+
+    root_weight = fake_root / "best.pt.pt"
+    root_weight.write_bytes(b"PK\x03\x04" + b"\x00" * 4096)
+    resolved = resolve_weight_path("weights/best.pt", auto_download=False)
+    assert resolved == fake_default
+    assert fake_default.is_file()
+
+    # 3. _torch_load_compat sets weights_only=False by default
+    recorded_kwargs = {}
+
+    class DummyTorch:
+        @staticmethod
+        def load(*_args, **kwargs):
+            recorded_kwargs.update(kwargs)
+            return {"model": None}
+
+    with _torch_load_compat(DummyTorch):
+        DummyTorch.load("dummy.pt", map_location="cpu")
+    assert recorded_kwargs.get("weights_only") is False
+
+    # 4. Single-dash -effective_damage 77 works in CLI
+    parser = build_arg_parser()
+    assert parser.parse_args(["-effective_damage", "77"]).effective_damage == 77.0
