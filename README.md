@@ -7,6 +7,16 @@ This repository provides a **read-only, non-injection** visual companion for ide
 - **Zero Injection**: Performs **no** game process/memory reading or DLL injection, and **no** synthetic mouse/keyboard input (`pynput` removed).
 - **Only Last-Hittable Minions Shown**: Minions whose conservative upper-bound HP exceeds your configured effective attack damage—or whose detection/health-bar reading is ambiguous, clipped, or low-confidence—are excluded and never rendered.
 - **Minion Prioritization Preserved**: Eligible last-hittable minions are ranked by distance to the player anchor (`#1` nearest priority target highlighted in yellow, `#2+` secondary last-hittable minions in green), with deterministic tie-breaking by remaining HP upper bound and bounding box.
+- **Markers On Your Game Screen**: The prioritized minions are drawn by a **click-through, always-on-top overlay** directly on the captured desktop, not just inside the companion preview window. The overlay is a separate top-most Tk window: it never reads the game process, never sends input, and never takes keyboard focus (`--no-overlay` disables it).
+
+## Display Modes
+| Mode | Command | What you see |
+| --- | --- | --- |
+| Overlay + preview (default) | `run.bat --monitor_idx 1` | Triangle markers over the game plus the annotated preview window |
+| Overlay only | `run.bat --monitor_idx 1 --no-visualize` | Only the click-through markers over the game (quit with `Ctrl+C`) |
+| Preview only | `run.bat --monitor_idx 1 --no-overlay` | Markers only inside the preview window |
+
+Overlay markers are small triangles drawn above each minion's head (`--overlay_gap`, default 16 px) so they never cover a health bar and never corrupt the next frame's health reading. Like screen capture, the overlay requires the game to run in **Borderless** or **Windowed** mode; Exclusive Fullscreen hides any external window.
 
 ## Installation
 
@@ -41,6 +51,11 @@ Or run `main.py` directly with Python:
 python main.py --monitor_idx 1 --visualize True --minion_color red --H 720 --W 1280 --effective_damage 80
 ```
 
+Overlay-only mode (markers over the game, no preview window):
+```bash
+python main.py --monitor_idx 1 --no-visualize --minion_color red --H 720 --W 1280 --effective_damage 80
+```
+
 Inspect available monitor indices:
 ```bash
 python main.py --list-monitors
@@ -53,6 +68,8 @@ python main.py --list-monitors
 - `--H`, `--W`: Target frame height and width (default `720` x `1280` for low latency).
 - `--imgsz`: YOLOv9 inference resolution (default `640` for low latency; `960` for maximum range).
 - `--sync`: Run capture and inference synchronously instead of the default low-latency asynchronous pipeline.
+- `--overlay` / `--no-overlay`: Enable or disable the click-through desktop overlay that draws last-hit markers on the game screen (default enabled; automatically skipped with a warning if the Python build has no `tkinter`).
+- `--overlay_gap`: Distance in frame pixels between a minion's bounding box top and its overlay marker (default `16`).
 - `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage.
 - `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`: Conservative upper bounds on minion maximum HP.
 - `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.0`).

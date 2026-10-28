@@ -593,3 +593,207 @@ def test_async_detection_worker_and_live_frame_health_reevaluation():
         assert candidates_2[0].health_upper_bound <= 77.0
     finally:
         worker.stop()
+
+
+def test_overlay_is_lazily_loaded_and_stays_headless_safe():
+    """The overlay must import tkinter lazily so headless/CI imports never create a window."""
+    overlay_path = REPO_ROOT / "my_utils" / "visualizers" / "overlay.py"
+    tree = ast.parse(overlay_path.read_text(encoding="utf-8"), filename=str(overlay_path))
+    top_level_imports = set()
+    for node in tree.body:  # module level only
+        if isinstance(node, ast.Import):
+            top_level_imports.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top_level_imports.add(node.module.split(".")[0])
+    assert "tkinter" not in top_level_imports
+
+    from my_utils.visualizers.overlay import DesktopOverlay, OverlayUnavailable
+
+    # Monitor validation happens before any Tk object is created.
+    with pytest.raises(ValueError):
+        DesktopOverlay({"left": 0, "top": 0, "width": 0, "height": 1080})
+    with pytest.raises(ValueError):
+        DesktopOverlay({"left": 0, "top": 0})
+
+    try:
+        import tkinter  # noqa: F401
+
+        has_tk = True
+    except Exception:
+        has_tk = False
+    if not has_tk:
+        with pytest.raises(OverlayUnavailable):
+            DesktopOverlay({"left": 0, "top": 0, "width": 1920, "height": 1080})
+
+
+def test_overlay_marker_geometry_and_monitor_mapping():
+    from my_utils.visualizers.overlay import (
+        DEFAULT_MARKER_GAP,
+        PRIMARY_TARGET_COLOR,
+        SECONDARY_TARGET_COLOR,
+        DesktopOverlay,
+        display_scale,
+        marker_polygon,
+    )
+
+    # Markers float entirely above the bounding box, centred on it, above the health bar.
+    points = marker_polygon((100, 200, 140, 260), gap=DEFAULT_MARKER_GAP)
+    assert points[0][0] == 120.0
+    assert points[0][1] == 200.0 - DEFAULT_MARKER_GAP
+    assert all(y < 200.0 for _, y in points)
+    assert len(points) == 3
+
+    with pytest.raises(ValueError):
+        marker_polygon((1, 2, 3))
+    with pytest.raises(ValueError):
+        marker_polygon((100, 200, 140, 260), gap=-5)
+    with pytest.raises(ValueError):
+        marker_polygon((100, float("nan"), 140, 260))
+
+    # DPI virtualisation ratio between Tk logical units and mss physical pixels.
+    assert display_scale(1920, 1920) == 1.0
+    assert abs(display_scale(2400, 1920) - 1.25) < 1e-9
+    assert display_scale(0, 1920) == 1.0
+    assert display_scale(None, 1920) == 1.0
+
+    class _FakeCanvas:
+        def __init__(self):
+            self.polygons = []
+
+        def delete(self, *_args):
+            self.polygons.clear()
+
+        def create_polygon(self, *coords, **kwargs):
+            self.polygons.append((coords, kwargs))
+
+    class _FakeRoot:
+        def update(self):
+            pass
+
+    overlay = DesktopOverlay.__new__(DesktopOverlay)
+    overlay.monitor_left = 0
+    overlay.monitor_top = 0
+    overlay.monitor_width = 1920
+    overlay.monitor_height = 1080
+    overlay.marker_gap = 16.0
+    overlay._display_scale = 1.0
+    overlay._max_interval = 0.0
+    overlay._last_render = 0.0
+    overlay._closed = False
+    overlay._tkinter = None
+    overlay._root = _FakeRoot()
+    overlay._canvas = _FakeCanvas()
+
+    primary = LastHitCandidate(
+        minion=Minion("red caster minion", 0.10, (960, 500, 1000, 560), 0.9),
+        health_upper_bound=30.0,
+        distance=5.0,
+    )
+    secondary = LastHitCandidate(
+        minion=Minion("red melee minion", 0.10, (480, 500, 520, 560), 0.9),
+        health_upper_bound=50.0,
+        distance=90.0,
+    )
+    overlay.render([primary, secondary], (1080, 1920, 3))
+
+    assert len(overlay._canvas.polygons) == 2
+    primary_coords, primary_kwargs = overlay._canvas.polygons[0]
+    secondary_coords, secondary_kwargs = overlay._canvas.polygons[1]
+    assert primary_kwargs["fill"] == PRIMARY_TARGET_COLOR
+    assert secondary_kwargs["fill"] == SECONDARY_TARGET_COLOR
+    # Frame pixels map 1:1 onto the monitor here, so the marker tip sits 16px above the box.
+    assert primary_coords[0] == 980.0
+    assert primary_coords[1] == 500.0 - 16.0
+    assert secondary_coords[0] == 500.0
+
+    # Closing is idempotent and silences further drawing.
+    overlay.close()
+    assert overlay.closed is True
+    overlay.render([primary], (1080, 1920, 3))
+    assert len(overlay._canvas.polygons) == 2
+
+
+def test_overlay_cli_flags_and_defaults():
+    parser = build_arg_parser()
+    default_args = parser.parse_args([])
+    assert default_args.overlay is True
+    assert default_args.overlay_gap > 0
+
+    assert parser.parse_args(["--overlay", "False"]).overlay is False
+    assert parser.parse_args(["--no-overlay"]).overlay is False
+    assert parser.parse_args(["--overlay"]).overlay is True
+    assert parser.parse_args(["--overlay_gap", "24"]).overlay_gap == 24.0
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--overlay_gap", "-3"])
+
+
+def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
+    """The capture loop must feed last-hit candidates to the desktop overlay (not only the preview)."""
+    import main as main_module
+
+    img = np.zeros((300, 400, 3), dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, _frame):
+            return {
+                "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+                "red_health_bars": [((100, 90, 160, 98), 0.89)],
+                "blue_minions": [],
+                "blue_health_bars": [],
+                "cur_object_counts": {},
+            }
+
+    remaining = [CapturedFrame(image=img.copy(), captured_at=1.0) for _ in range(3)]
+
+    class FakeFrameLoader:
+        monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+        primary_monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def grab(self, window_rect=None):
+            if not remaining:
+                raise KeyboardInterrupt
+            return remaining.pop(0)
+
+    events = []
+
+    class FakeOverlay:
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0):
+            self.closed = False
+            events.append(("init", monitor["width"], primary_width, marker_gap))
+
+        def render(self, candidates, frame_shape):
+            events.append(("render", len(candidates), tuple(frame_shape[:2])))
+
+        def close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr(main_module, "Detector", FakeDetector)
+    monkeypatch.setattr(main_module, "FrameLoader", FakeFrameLoader)
+    monkeypatch.setattr(main_module, "DesktopOverlay", FakeOverlay)
+
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(["--sync", "--no-visualize", "--overlay_gap", "20"])
+
+    assert events[0] == ("init", 400, 400, 20.0)
+    assert ("render", 1, (300, 400)) in events
+    assert events[-1] == ("close",)
+
+    # --no-overlay keeps the desktop clean.
+    events.clear()
+    remaining.extend(CapturedFrame(image=img.copy(), captured_at=1.0) for _ in range(3))
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(["--sync", "--no-visualize", "--no-overlay"])
+    assert events == []
