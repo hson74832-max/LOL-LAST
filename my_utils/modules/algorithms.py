@@ -32,7 +32,7 @@ def _box_iou(a, b):
 
 
 def _deduplicate(detections, threshold=0.8):
-    """Collapse duplicate boxes; discard a cluster if its type is disputed."""
+    """Collapse duplicate boxes; discard a cluster only if its top classes are tied."""
     parents = list(range(len(detections)))
 
     def root(i):
@@ -50,18 +50,31 @@ def _deduplicate(detections, threshold=0.8):
         groups.setdefault(root(i), []).append(detection)
     result = []
     for group in groups.values():
-        if len({d.label for d in group}) != 1:
+        ranked = sorted(group, key=lambda d: (-d.confidence, d.bbox))
+        top = ranked[0]
+        conflicting = [
+            d for d in ranked[1:]
+            if d.label != top.label and (top.confidence - d.confidence) < 0.05
+        ]
+        if conflicting:
             continue
-        result.append(sorted(group, key=lambda d: (-d.confidence, d.bbox))[0])
+        result.append(top)
     return sorted(result, key=lambda d: (d.bbox, d.label))
 
 
 class ObjectAssociator:
-    def __init__(self, intersection_threshold=0.5, min_confidence=0.6,
-                 ambiguity_margin=0.05, health_bar_utils=None):
-        for name, value in (("intersection threshold", intersection_threshold),
-                            ("minimum confidence", min_confidence),
-                            ("ambiguity margin", ambiguity_margin)):
+    def __init__(
+        self,
+        intersection_threshold=0.5,
+        min_confidence=0.25,
+        ambiguity_margin=0.05,
+        health_bar_utils=None,
+    ):
+        for name, value in (
+            ("intersection threshold", intersection_threshold),
+            ("minimum confidence", min_confidence),
+            ("ambiguity margin", ambiguity_margin),
+        ):
             if not isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be between 0 and 1")
         if intersection_threshold == 0 or min_confidence == 0:
@@ -84,6 +97,8 @@ class ObjectAssociator:
 
     def _prepare(self, entries, img_shape, minion_color, is_bar, excluded_regions):
         height, width = img_shape[:2]
+        # Low-HP health bars have very few colored pixels, so YOLOv9 reports lower confidence on them.
+        threshold = min(self.min_confidence, 0.20) if is_bar else self.min_confidence
         detections = []
         for entry in entries:
             try:
@@ -93,7 +108,9 @@ class ObjectAssociator:
                 else:
                     box, label, confidence = entry
                     label = normalize_label(label)
-                    if label not in {f"{minion_color} {kind} minion" for kind in ("caster", "melee", "siege")}:
+                    if label not in {
+                        f"{minion_color} {kind} minion" for kind in ("caster", "melee", "siege")
+                    }:
                         continue
                 box = tuple(float(value) for value in box)
                 confidence = float(confidence)
@@ -103,7 +120,7 @@ class ObjectAssociator:
                 # Boxes touching an edge may be clipped; partial bars are unsafe.
                 if not (0 < x1 < x2 < width and 0 < y1 < y2 < height):
                     continue
-                if not self.min_confidence <= confidence <= 1:
+                if not threshold <= confidence <= 1:
                     continue
                 if any(_intersects(box, region) for region in excluded_regions):
                     continue
@@ -122,28 +139,55 @@ class ObjectAssociator:
         if not bodies or not bars:
             return []
 
-        ratios = self._get_intersected_area(
-            np.asarray([bar.bbox for bar in bars]), np.asarray([body.bbox for body in bodies])
-        )
+        bar_boxes = np.asarray([bar.bbox for bar in bars], dtype=float)
+        body_boxes = np.asarray([body.bbox for body in bodies], dtype=float)
+        ratios = self._get_intersected_area(bar_boxes, body_boxes)
         valid = ratios >= self.intersection_threshold
-        # Prefer the largest number of valid matches, then the best overlap.
+
+        # Prefer health bars aligned near the top of their minion's bounding box.
+        bar_cy = 0.5 * (bar_boxes[:, 1] + bar_boxes[:, 3])[:, None]
+        body_top = body_boxes[:, 1][None, :]
+        body_h = np.maximum(1.0, body_boxes[:, 3] - body_boxes[:, 1])[None, :]
+        rel_y = np.minimum(1.0, np.abs(bar_cy - body_top) / body_h)
+        effective_scores = np.where(valid, ratios - 0.25 * rel_y, 0.0)
+
+        # Prefer the largest number of valid matches, then the best top-aligned overlap.
         bonus = min(len(bars), len(bodies)) + 1
-        scores = np.where(valid, bonus + ratios, 0.0)
-        rows, columns = linear_sum_assignment(scores, maximize=True)
+        assignment_scores = np.where(valid, bonus + effective_scores, 0.0)
+        rows, columns = linear_sum_assignment(assignment_scores, maximize=True)
+
+        matched_pairs = [
+            (bar_idx, body_idx)
+            for bar_idx, body_idx in zip(rows, columns)
+            if valid[bar_idx, body_idx]
+        ]
+        assigned_bars = {bar_idx for bar_idx, _ in matched_pairs}
+        assigned_bodies = {body_idx for _, body_idx in matched_pairs}
+        unassigned_bars = [i for i in range(len(bars)) if i not in assigned_bars]
+        unassigned_bodies = [j for j in range(len(bodies)) if j not in assigned_bodies]
+
         matched = []
-        for bar_idx, body_idx in zip(rows, columns):
-            if not valid[bar_idx, body_idx]:
+        for bar_idx, body_idx in matched_pairs:
+            score = effective_scores[bar_idx, body_idx]
+            competing_bodies = [
+                effective_scores[bar_idx, j]
+                for j in unassigned_bodies
+                if valid[bar_idx, j]
+            ]
+            competing_bars = [
+                effective_scores[i, body_idx]
+                for i in unassigned_bars
+                if valid[i, body_idx]
+            ]
+            if any(
+                alt >= score - self.ambiguity_margin
+                for alt in (competing_bodies + competing_bars)
+            ):
                 continue
-            score = ratios[bar_idx, body_idx]
-            row_alternatives = np.delete(ratios[bar_idx, :], body_idx)
-            col_alternatives = np.delete(ratios[:, body_idx], bar_idx)
-            # Don't guess if a bar or body has a similarly plausible partner.
-            if any((alt >= self.intersection_threshold and alt >= score - self.ambiguity_margin)
-                   for alt in np.concatenate((row_alternatives, col_alternatives))):
-                continue
+
             bar, body = bars[bar_idx], bodies[body_idx]
             x1, y1, x2, y2 = bar.bbox
-            crop = img[floor(y1):ceil(y2), floor(x1):ceil(x2)]
+            crop = img[floor(y1) : ceil(y2), floor(x1) : ceil(x2)]
             health = self.health_bar_utils.get_health_level(crop, bar_color=minion_color)
             if health is None:
                 continue
@@ -158,14 +202,21 @@ class ObjectAssociator:
 
     @staticmethod
     def _get_intersected_area(health_bar_boxes, minion_boxes):
-        """Fraction of each health bar covered by each minion detection."""
+        """Fraction of each health bar covered by each minion detection (including slight top float)."""
+        body_heights = np.maximum(0.0, minion_boxes[:, 3] - minion_boxes[:, 1])
+        expanded_y1 = minion_boxes[:, 1] - 0.15 * body_heights
+
         x1 = np.maximum(health_bar_boxes[:, 0, None], minion_boxes[:, 0])
-        y1 = np.maximum(health_bar_boxes[:, 1, None], minion_boxes[:, 1])
+        y1 = np.maximum(health_bar_boxes[:, 1, None], expanded_y1)
         x2 = np.minimum(health_bar_boxes[:, 2, None], minion_boxes[:, 2])
         y2 = np.minimum(health_bar_boxes[:, 3, None], minion_boxes[:, 3])
         intersection = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
         areas = np.maximum(health_bar_boxes[:, 2] - health_bar_boxes[:, 0], 0) * np.maximum(
             health_bar_boxes[:, 3] - health_bar_boxes[:, 1], 0
         )
-        return np.divide(intersection, areas[:, None], out=np.zeros_like(intersection, dtype=float),
-                         where=areas[:, None] > 0)
+        return np.divide(
+            intersection,
+            areas[:, None],
+            out=np.zeros_like(intersection, dtype=float),
+            where=areas[:, None] > 0,
+        )
