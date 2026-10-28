@@ -1204,3 +1204,158 @@ def test_directml_detector_builds_on_cpu_and_moves_model_to_dml(monkeypatch, tmp
     assert detector.directml is False
     assert detector.device_name == "cpu"
     assert "falling back to CPU" in capsys.readouterr().out
+
+
+def test_directml_status_reports_actionable_reasons(monkeypatch):
+    from my_utils.modules import detector as detector_module
+
+    monkeypatch.setitem(sys.modules, "torch_directml", None)
+    available, reason = detector_module.directml_status()
+    assert available is False
+    assert "not installed" in reason
+
+    import types as _types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_directml",
+        _types.SimpleNamespace(is_available=lambda: False, device=lambda: "dml"),
+    )
+    available, reason = detector_module.directml_status()
+    assert available is False and "no usable DirectML device" in reason
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_directml",
+        _types.SimpleNamespace(is_available=lambda: True, device=lambda: "dml"),
+    )
+    available, reason = detector_module.directml_status()
+    assert available is True and "available" in reason
+
+
+def _fake_torch_for_device_tests():
+    import types as _types
+
+    class FakeDevice:
+        def __init__(self, name):
+            self.name = str(name)
+            self.type = self.name.split(":")[0]
+
+        def __str__(self):
+            return self.name
+
+    class FakeNet:
+        def to(self, device):
+            return self
+
+    class FakeModel:
+        names = {0: "red_caster_minion", 1: "red_health_bar"}
+        stride = 32
+        pt = True
+
+        def __init__(self):
+            self.device = "cpu"
+            self.model = FakeNet()
+
+    torch_module = _types.SimpleNamespace(
+        device=FakeDevice,
+        load=lambda *a, **k: {},
+        backends=_types.SimpleNamespace(cudnn=_types.SimpleNamespace(benchmark=False)),
+    )
+    return torch_module, FakeModel
+
+
+def _patch_detector_backend(monkeypatch, torch_module, FakeModel):
+    from my_utils.modules import detector as detector_module
+
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setattr(
+        detector_module, "resolve_weight_path", lambda *a, **k: Path("best.pt")
+    )
+    monkeypatch.setattr(
+        detector_module,
+        "_load_yolov9_symbols",
+        lambda: (
+            lambda *a, **k: FakeModel(),
+            lambda img, size, stride=32, auto=True: (img, None, None),
+            lambda pred, **kwargs: [pred],
+            lambda *a, **k: a[1],
+        ),
+    )
+    return detector_module
+
+
+def test_missing_directml_falls_back_to_cpu_instead_of_crashing(monkeypatch, capsys):
+    """`--device directml` without torch-directml must warn and keep running on CPU."""
+    from my_utils.modules.detector import Detector
+
+    torch_module, FakeModel = _fake_torch_for_device_tests()
+    _patch_detector_backend(monkeypatch, torch_module, FakeModel)
+    monkeypatch.setitem(sys.modules, "torch_directml", None)
+
+    detector = Detector(device="directml")
+
+    assert detector.directml is False
+    assert detector.device_name == "cpu"
+    assert detector.device_fallback_reason
+    out = capsys.readouterr().out
+    assert "[WARNING] DirectML was requested but is unavailable" in out
+    assert "torch-directml is not installed" in out
+    # The hint must name the exact interpreter that is running the companion.
+    assert ".venv\\Scripts\\python.exe -m pip install torch-directml" in out
+    assert "separate packages" in out
+    assert "CPU (DirectML fallback)" in out
+
+    # --strict_device keeps the old hard failure for users who want it.
+    with pytest.raises(RuntimeError) as excinfo:
+        Detector(device="directml", strict_device=True)
+    assert "torch-directml" in str(excinfo.value)
+
+
+def test_check_devices_reports_backends_and_how_to_fix_them(monkeypatch, capsys):
+    import types as _types
+
+    from my_utils.modules import detector as detector_module
+
+    parser = build_arg_parser()
+    assert parser.parse_args(["--check-devices"]).check_devices is True
+    assert parser.parse_args([]).check_devices is False
+    assert parser.parse_args(["--strict_device"]).strict_device is True
+
+    fake_torch = _types.SimpleNamespace(
+        __version__="2.9.0+cpu",
+        cuda=_types.SimpleNamespace(is_available=lambda: False),
+        backends=_types.SimpleNamespace(mps=_types.SimpleNamespace(is_available=lambda: False)),
+    )
+    monkeypatch.setitem(sys.modules, "torch_directml", None)
+    lines = detector_module.diagnose_devices(fake_torch)
+    report = "\n".join(lines)
+    assert "torch               : 2.9.0+cpu" in report
+    assert "CUDA (NVIDIA)       : not available" in report
+    assert "DirectML (AMD/Intel): not available" in report
+    assert "not installed" in report
+    assert "torch-directml" in report
+    assert "Selected backend    : cpu" in report
+
+    # Working DirectML is reported as available and becomes the selected backend.
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_directml",
+        _types.SimpleNamespace(is_available=lambda: True, device=lambda: "dml"),
+    )
+    monkeypatch.setattr(detector_module, "directml_available", lambda: True)
+    lines = detector_module.diagnose_devices(fake_torch)
+    report = "\n".join(lines)
+    assert "DirectML (AMD/Intel): available" in report
+    assert "Selected backend    : directml" in report
+
+    # The CLI shortcut prints the report and exits without loading any model.
+    import main as main_module
+
+    monkeypatch.setattr(
+        main_module, "diagnose_devices", lambda: ["torch : test-version", "", "Selected backend    : cpu"]
+    )
+    assert main_module.main(["--check-devices"]) == 0
+    out = capsys.readouterr().out
+    assert "Inference backend diagnostics" in out
+    assert "[INFO] torch : test-version" in out

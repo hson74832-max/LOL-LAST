@@ -45,35 +45,51 @@ def is_directml_request(device) -> bool:
     return str(device).strip().lower() in DIRECTML_ALIASES
 
 
-def directml_available() -> bool:
-    """True when torch-directml is installed and reports a usable device."""
+# torch and torch-directml are *different* packages: installing "pytorch" does not
+# provide DirectML.  The pinned torch version matters because pip will downgrade torch
+# to whatever torch-directml pins (2.4.1 at the time of writing).
+DIRECTML_INSTALL_COMMAND = (
+    '{python} -m pip install torch-directml        '
+    "(Windows, AMD/Intel GPU; installs torch 2.4.1 + torchvision 0.19.1)"
+)
+DIRECTML_HELP = (
+    "[HOW TO FIX] torch and torch-directml are separate packages - installing PyTorch\n"
+    "             does not install DirectML. Run inside this project folder:\n"
+    "                 .venv\\Scripts\\python.exe -m pip install torch-directml\n"
+    "             or re-run:  install_requirements.bat --directml\n"
+    "             Notes: Windows only, 64-bit Python 3.8-3.12 required, and pip will\n"
+    "             downgrade torch to 2.4.1 (that is expected).\n"
+    "             Run  run.bat --check-devices  to see exactly what is missing."
+)
+
+
+def directml_status() -> tuple[bool, str]:
+    """Return (available, human readable reason) for the torch-directml backend."""
     try:
         import torch_directml  # type: ignore[import-not-found]
-    except Exception:
-        return False
+    except Exception as exc:
+        return False, f"torch-directml is not installed ({type(exc).__name__}: {exc})"
     try:
-        return bool(torch_directml.is_available())
-    except Exception:
-        return False
+        is_available = getattr(torch_directml, "is_available", None)
+        if callable(is_available) and not is_available():
+            return False, "torch-directml is installed but reports no usable DirectML device"
+    except Exception as exc:
+        return False, f"torch-directml failed to initialise ({type(exc).__name__}: {exc})"
+    return True, "torch-directml device available"
+
+
+def directml_available() -> bool:
+    """True when torch-directml is installed and reports a usable device."""
+    return directml_status()[0]
 
 
 def directml_device():
     """Return the torch-directml device object, with actionable install hints on failure."""
-    try:
-        import torch_directml  # type: ignore[import-not-found]
-    except Exception as exc:
-        raise RuntimeError(
-            "DirectML was requested but torch-directml is not installed.\n"
-            "  Windows (AMD/Intel GPUs): pip install torch-directml\n"
-            "  or re-run: install_requirements.bat --directml\n"
-            "  Linux (AMD GPUs): install ROCm-enabled PyTorch from https://pytorch.org instead."
-        ) from exc
-    try:
-        is_available = getattr(torch_directml, "is_available", None)
-        if callable(is_available) and not is_available():
-            raise RuntimeError("torch-directml is installed but reports no usable DirectML device")
-    except AttributeError:
-        pass
+    available, reason = directml_status()
+    if not available:
+        raise RuntimeError(f"DirectML is unavailable: {reason}\n{DIRECTML_HELP}")
+    import torch_directml  # type: ignore[import-not-found]
+
     return torch_directml.device()
 
 
@@ -93,10 +109,105 @@ CPU_DEVICE_HINT = (
     "[NOTE] Running on CPU. This is the usual cause of markers that lag behind or stay "
     "on minions that are already dead.\n"
     "       NVIDIA GPU : re-run run.bat / install_requirements.bat to get CUDA PyTorch\n"
-    "       AMD/Intel  : install_requirements.bat --directml   (pip install torch-directml)\n"
+    "       AMD/Intel  : .venv\\Scripts\\python.exe -m pip install torch-directml\n"
+    "                    (torch-directml is a separate package from PyTorch; Windows only)\n"
     "       AMD Linux  : install ROCm PyTorch from https://pytorch.org\n"
-    "       Otherwise  : lower --imgsz (e.g. --imgsz 480) and/or --H/--W to cut inference time."
+    "       Otherwise  : lower --imgsz (e.g. --imgsz 480) and/or --H/--W to cut inference time.\n"
+    "       Diagnose   : run.bat --check-devices"
 )
+
+
+def diagnose_devices(torch_module=None) -> list[str]:
+    """Human readable report of every inference backend and how to enable it."""
+    import platform
+    import shutil
+    import struct
+    import sys
+
+    lines = []
+    bits = struct.calcsize("P") * 8
+    lines.append(
+        f"Python              : {platform.python_version()} ({bits}-bit) at {sys.executable}"
+    )
+    lines.append(f"Platform            : {platform.platform()}")
+
+    installer = "install_requirements.bat" if platform.system() == "Windows" else "./install_requirements.sh"
+    if torch_module is None:
+        try:
+            import torch as torch_module  # noqa: PLC0415
+        except Exception as exc:
+            lines.append(f"torch               : NOT installed ({type(exc).__name__}: {exc})")
+            lines.append("")
+            lines.append(f"Fix: {installer}")
+            return lines
+
+    lines.append(f"torch               : {getattr(torch_module, '__version__', 'unknown')}")
+
+    cuda_ok = False
+    try:
+        cuda_ok = bool(torch_module.cuda.is_available())
+    except Exception:
+        pass
+    cuda_name = ""
+    if cuda_ok:
+        try:
+            cuda_name = f" ({torch_module.cuda.get_device_name(0)})"
+        except Exception:
+            cuda_name = ""
+    lines.append(
+        f"CUDA (NVIDIA)       : {'available' + cuda_name if cuda_ok else 'not available'}"
+    )
+    if not cuda_ok and shutil.which("nvidia-smi"):
+        lines.append(
+            "                      nvidia-smi exists but torch cannot use CUDA -> this is a "
+            "CPU-only PyTorch build."
+        )
+        lines.append(
+            "                      Fix: .venv\\Scripts\\python.exe -m pip install --force-reinstall "
+            "torch torchvision --index-url https://download.pytorch.org/whl/cu124"
+        )
+
+    mps_ok = False
+    try:
+        mps = getattr(torch_module.backends, "mps", None)
+        mps_ok = bool(mps is not None and mps.is_available())
+    except Exception:
+        pass
+    lines.append(f"Apple MPS           : {'available' if mps_ok else 'not available'}")
+
+    dml_ok, dml_reason = directml_status()
+    lines.append(f"DirectML (AMD/Intel): {'available' if dml_ok else 'not available'} - {dml_reason}")
+    if not dml_ok:
+        if platform.system() == "Windows":
+            if sys.version_info[:2] > (3, 12):
+                lines.append(
+                    "                      torch-directml has no wheel for Python "
+                    f"{platform.python_version()}; it needs 64-bit Python 3.8-3.12."
+                )
+                lines.append(
+                    "                      Fix: recreate .venv with Python 3.12, then: "
+                    "install_requirements.bat --directml"
+                )
+            else:
+                lines.append(
+                    "                      Fix: .venv\\Scripts\\python.exe -m pip install "
+                    "torch-directml"
+                )
+                lines.append(
+                    "                      (separate package from PyTorch; downgrades torch to 2.4.1)"
+                )
+        else:
+            lines.append(
+                "                      DirectML is Windows-only; on Linux use ROCm PyTorch "
+                "from https://pytorch.org"
+            )
+
+    chosen = select_default_device(torch_module)
+    lines.append("")
+    lines.append(f"Selected backend    : {chosen}")
+    if chosen == "cpu":
+        lines.append("Expected speed     : slow (CPU). Markers will lag behind the game.")
+    return lines
 
 
 def _is_valid_checkpoint_file(path: Path) -> bool:
@@ -351,6 +462,7 @@ class Detector:
         iou_thres: float = 0.45,
         backend=None,
         auto_download: bool = True,
+        strict_device: bool = False,
     ):
         if not 0 < float(conf_thres) <= 1:
             raise ValueError("confidence threshold must be in (0, 1]")
@@ -369,6 +481,7 @@ class Detector:
         self.iou_thres = float(iou_thres)
 
         self.directml = False
+        self.device_fallback_reason: str | None = None
         self.device_name = "backend"
         if backend is not None:
             self.model = backend
@@ -385,6 +498,18 @@ class Detector:
             requested_device = str(device) if device else select_default_device(torch)
             self.directml = is_directml_request(requested_device)
             if self.directml:
+                available, reason = directml_status()
+                if not available:
+                    # An explicit GPU request that cannot be honoured must not abort the
+                    # whole companion with a traceback: explain and continue on CPU.
+                    message = f"DirectML was requested but is unavailable: {reason}"
+                    if strict_device:
+                        raise RuntimeError(f"{message}\n{DIRECTML_HELP}")
+                    print(f"[WARNING] {message}")
+                    print(DIRECTML_HELP)
+                    self.directml = False
+                    self.device_fallback_reason = reason
+            if self.directml:
                 # torch-directml exposes a "privateuseone" torch device, but YOLOv9's
                 # DetectMultiBackend only validates CUDA device strings, so the model is
                 # built on CPU and then moved onto the DirectML device explicitly.
@@ -397,7 +522,8 @@ class Detector:
                         "Pass --device cuda:0 to use fp16 on an NVIDIA GPU."
                     )
             else:
-                resolved_device = torch.device(requested_device)
+                fallback_name = "cpu" if self.device_fallback_reason else requested_device
+                resolved_device = torch.device(fallback_name)
                 build_device = resolved_device
                 use_half = (resolved_device.type == "cuda") if half is None else bool(half)
             if build_device.type == "cuda" and hasattr(torch.backends, "cudnn"):
@@ -429,7 +555,12 @@ class Detector:
                 except Exception:
                     pass
             self.device_name = str(resolved_device)
-            backend_label = "DirectML" if self.directml else resolved_device.type.upper()
+            if self.directml:
+                backend_label = "DirectML"
+            elif self.device_fallback_reason:
+                backend_label = "CPU (DirectML fallback)"
+            else:
+                backend_label = resolved_device.type.upper()
             print(
                 f"[INFO] Detector initialized on device={resolved_device} [{backend_label}] "
                 f"(fp16={getattr(self.model, 'fp16', use_half)}, imgsz={self.imgsz})"
@@ -439,7 +570,7 @@ class Detector:
                     "[NOTE] AMD/Intel GPU acceleration via torch-directml is active. "
                     "DirectML is slower than CUDA but far faster than CPU inference."
                 )
-            elif resolved_device.type == "cpu":
+            elif resolved_device.type == "cpu" and not self.device_fallback_reason:
                 print(CPU_DEVICE_HINT)
             self._letterbox = letterbox
             self._nms = non_max_suppression

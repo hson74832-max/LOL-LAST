@@ -88,24 +88,44 @@ if not errorlevel 1 (
 )
 
 if "%USE_DIRECTML%"=="1" (
+    %TARGET_PYTHON% -c "import sys,struct; raise SystemExit(0 if (3,8) <= sys.version_info[:2] <= (3,12) and struct.calcsize('P')*8 == 64 else 1)"
+    if errorlevel 1 (
+        echo [ERROR] torch-directml needs 64-bit Python 3.8 - 3.12.
+        echo         Current interpreter: %TARGET_PYTHON%
+        %TARGET_PYTHON% -c "import sys,struct,platform; print('         Python ' + platform.python_version() + ' (' + str(struct.calcsize('P')*8) + '-bit)')"
+        echo         Delete the .venv folder, install Python 3.12 from python.org,
+        echo         then run: install_requirements.bat --directml
+        goto :fail
+    )
+
     echo [INFO] Installing DirectML PyTorch for AMD/Intel GPU inference...
+    echo        This is a separate package from PyTorch and pins torch 2.4.1 / torchvision 0.19.1;
+    echo        pip will downgrade torch accordingly. That is expected.
     %TARGET_PYTHON% -m pip install --upgrade torch-directml
     if errorlevel 1 (
-        echo [WARNING] torch-directml could not be installed. The companion will run on CPU.
+        echo [ERROR] torch-directml could not be installed.
+        echo         Check your internet connection, then run manually:
+        echo             %TARGET_PYTHON% -m pip install torch-directml
+        goto :fail
+    )
+
+    %TARGET_PYTHON% -c "import torch_directml; raise SystemExit(0 if torch_directml.is_available() else 1)"
+    if errorlevel 1 (
+        echo [WARNING] torch-directml is installed but reports no usable DirectML device.
+        echo           Update your AMD/Intel GPU driver from the vendor website, then re-check with:
+        echo               run.bat --check-devices
     ) else (
-        %TARGET_PYTHON% -c "import torch_directml; raise SystemExit(0 if torch_directml.is_available() else 1)"
-        if errorlevel 1 (
-            echo [WARNING] torch-directml is installed but no DirectML device was found.
-        ) else (
-            echo [INFO] DirectML GPU acceleration is ready.
-        )
+        echo [INFO] DirectML GPU acceleration is ready.
+        %TARGET_PYTHON% -c "import torch, torch_directml; print('[INFO] torch ' + torch.__version__ + ' | DirectML device: ' + str(torch_directml.device()))"
     )
 ) else (
     where nvidia-smi >nul 2>nul
     if errorlevel 1 (
         echo [HINT] No NVIDIA GPU detected. On an AMD or Intel GPU, re-run:
         echo            install_requirements.bat --directml
-        echo        to install DirectML PyTorch and speed inference up considerably.
+        echo        to install DirectML PyTorch ^(separate package from PyTorch^) and
+        echo        speed inference up considerably.
+        echo        Verify any time with:  run.bat --check-devices
     )
 )
 
@@ -149,6 +169,8 @@ echo               %TARGET_PYTHON% main.py --monitor_idx 1 --visualize True --mi
 if "%USE_DIRECTML%"=="1" (
     echo           DirectML build is installed; main.py picks it up automatically
     echo           ^(or force it with --device directml^).
+    echo           Recommended:
+    echo               run.bat --device directml --confirm_frames 3 --max_detection_age 0.2
 )
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
