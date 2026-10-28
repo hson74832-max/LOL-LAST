@@ -1,15 +1,11 @@
 from dataclasses import dataclass
-@dataclass
-class Minion:
 
-    def __init__(
-        self,
-        minion_type,
-        health_level,
-        bbox,
-        confidence,
-    ) -> None:
-        self.minion_type = minion_type
-        self.health_level = health_level
-        self.bbox = bbox
-        self.confidence = confidence
+
+@dataclass(frozen=True)
+class Minion:
+    """A detected minion with a conservative upper bound on its health fraction."""
+
+    minion_type: str
+    health_level: float
+    bbox: tuple[float, float, float, float]
+    confidence: float

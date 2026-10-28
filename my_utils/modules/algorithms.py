@@ -1,99 +1,171 @@
-from typing import Any
+"""Conservative association of detected minions and their health bars."""
+
+from dataclasses import dataclass
+from math import ceil, floor, isfinite
+
+import numpy as np
 from scipy.optimize import linear_sum_assignment
+
+from my_utils.data_structures.labels import normalize_label
 from my_utils.data_structures.minion import Minion
 from my_utils.modules.utils.health_bar_utils import HealthBarUtils
-import numpy as np
-import sys
 
-sys.path.append(f'./yolov9')
-from yolov9.utils.plots import Annotator, colors
+
+@dataclass(frozen=True)
+class _Detection:
+    bbox: tuple[float, float, float, float]
+    label: str
+    confidence: float
+
+
+def _intersects(a, b):
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+def _box_iou(a, b):
+    intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0, min(a[3], b[3]) - max(a[1], b[1])
+    )
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return intersection / (area_a + area_b - intersection) if intersection else 0.0
+
+
+def _deduplicate(detections, threshold=0.8):
+    """Collapse duplicate boxes; discard a cluster if its type is disputed."""
+    parents = list(range(len(detections)))
+
+    def root(i):
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    for i in range(len(detections)):
+        for j in range(i):
+            if _box_iou(detections[i].bbox, detections[j].bbox) >= threshold:
+                parents[root(i)] = root(j)
+    groups = {}
+    for i, detection in enumerate(detections):
+        groups.setdefault(root(i), []).append(detection)
+    result = []
+    for group in groups.values():
+        if len({d.label for d in group}) != 1:
+            continue
+        result.append(sorted(group, key=lambda d: (-d.confidence, d.bbox))[0])
+    return sorted(result, key=lambda d: (d.bbox, d.label))
 
 
 class ObjectAssociator:
-
-    def __init__(self, intersection_threshold = 0.5):
+    def __init__(self, intersection_threshold=0.5, min_confidence=0.6,
+                 ambiguity_margin=0.05, health_bar_utils=None):
+        for name, value in (("intersection threshold", intersection_threshold),
+                            ("minimum confidence", min_confidence),
+                            ("ambiguity margin", ambiguity_margin)):
+            if not isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+        if intersection_threshold == 0 or min_confidence == 0:
+            raise ValueError("intersection threshold and minimum confidence must be positive")
         self.intersection_threshold = intersection_threshold
-        self.health_bar_utils = HealthBarUtils()
+        self.min_confidence = min_confidence
+        self.ambiguity_margin = ambiguity_margin
+        self.health_bar_utils = health_bar_utils or HealthBarUtils()
 
-    def __call__(self, detection_result, img, minion_type = 'red'):
-        minions = detection_result[f'{minion_type}_minions']
-        health_bars = detection_result[f'{minion_type}_health_bars']
-        
-        return self.match_bars_to_minions(minions, health_bars, img)
+    def __call__(self, detection_result, img, minion_type="red", excluded_regions=()):
+        if minion_type not in {"red", "blue"}:
+            raise ValueError("minion color must be red or blue")
+        return self.match_bars_to_minions(
+            detection_result[f"{minion_type}_minions"],
+            detection_result[f"{minion_type}_health_bars"],
+            img,
+            minion_color=minion_type,
+            excluded_regions=excluded_regions,
+        )
 
-    def match_bars_to_minions(self, minions, health_bars, img):
+    def _prepare(self, entries, img_shape, minion_color, is_bar, excluded_regions):
+        height, width = img_shape[:2]
+        detections = []
+        for entry in entries:
+            try:
+                if is_bar:
+                    box, confidence = entry
+                    label = f"{minion_color} health bar"
+                else:
+                    box, label, confidence = entry
+                    label = normalize_label(label)
+                    if label not in {f"{minion_color} {kind} minion" for kind in ("caster", "melee", "siege")}:
+                        continue
+                box = tuple(float(value) for value in box)
+                confidence = float(confidence)
+                if len(box) != 4 or not all(isfinite(v) for v in box) or not isfinite(confidence):
+                    continue
+                x1, y1, x2, y2 = box
+                # Boxes touching an edge may be clipped; partial bars are unsafe.
+                if not (0 < x1 < x2 < width and 0 < y1 < y2 < height):
+                    continue
+                if not self.min_confidence <= confidence <= 1:
+                    continue
+                if any(_intersects(box, region) for region in excluded_regions):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            detections.append(_Detection(box, label, confidence))
+        return _deduplicate(detections)
 
-        if len(minions) == 0 or len(health_bars) == 0: return list()
+    def match_bars_to_minions(self, minions, health_bars, img, minion_color="red", excluded_regions=()):
+        if not isinstance(img, np.ndarray) or img.ndim != 3 or img.shape[2] != 3:
+            raise ValueError("frame must be a BGR image")
+        if minion_color not in {"red", "blue"}:
+            raise ValueError("minion color must be red or blue")
+        bodies = self._prepare(minions, img.shape, minion_color, False, excluded_regions)
+        bars = self._prepare(health_bars, img.shape, minion_color, True, excluded_regions)
+        if not bodies or not bars:
+            return []
 
-        minion_boxes = np.array([i[0] for i in minions])
-        health_bar_boxes = np.array([i[0] for i in health_bars])
-        hbars_vs_minions_ious = self._get_intersected_area(health_bar_boxes, minion_boxes)
-        
-        row_ind, col_ind = linear_sum_assignment(hbars_vs_minions_ious, maximize = True)
+        ratios = self._get_intersected_area(
+            np.asarray([bar.bbox for bar in bars]), np.asarray([body.bbox for body in bodies])
+        )
+        valid = ratios >= self.intersection_threshold
+        # Prefer the largest number of valid matches, then the best overlap.
+        bonus = min(len(bars), len(bodies)) + 1
+        scores = np.where(valid, bonus + ratios, 0.0)
+        rows, columns = linear_sum_assignment(scores, maximize=True)
+        matched = []
+        for bar_idx, body_idx in zip(rows, columns):
+            if not valid[bar_idx, body_idx]:
+                continue
+            score = ratios[bar_idx, body_idx]
+            row_alternatives = np.delete(ratios[bar_idx, :], body_idx)
+            col_alternatives = np.delete(ratios[:, body_idx], bar_idx)
+            # Don't guess if a bar or body has a similarly plausible partner.
+            if any((alt >= self.intersection_threshold and alt >= score - self.ambiguity_margin)
+                   for alt in np.concatenate((row_alternatives, col_alternatives))):
+                continue
+            bar, body = bars[bar_idx], bodies[body_idx]
+            x1, y1, x2, y2 = bar.bbox
+            crop = img[floor(y1):ceil(y2), floor(x1):ceil(x2)]
+            health = self.health_bar_utils.get_health_level(crop, bar_color=minion_color)
+            if health is None:
+                continue
+            try:
+                health = float(health)
+            except (TypeError, ValueError):
+                continue
+            if not isfinite(health) or not 0 < health <= 1:
+                continue
+            matched.append(Minion(body.label, health, body.bbox, body.confidence))
+        return matched
 
-        matched_minions = list()
-        for hbar_idx, minion_idx in zip(row_ind, col_ind):
-            if hbars_vs_minions_ious[hbar_idx, minion_idx] > self.intersection_threshold:
-                xyxy = health_bar_boxes[hbar_idx]
-                if 'red' in minions[minion_idx][1]: health_level = self.health_bar_utils.get_health_level(health_bar_img=img[int(xyxy[1]):int(xyxy[3]), int(xyxy[0]):int(xyxy[2])], bar_color='red')
-                else: health_level = self.health_bar_utils.get_health_level(health_bar_img=img[int(xyxy[1]):int(xyxy[3]), int(xyxy[0]):int(xyxy[2])], bar_color='blue')
-
-                matched_minions.append(Minion(
-                    minion_type=minions[minion_idx][1], 
-                    health_level=health_level, 
-                    bbox=minions[minion_idx][0],
-                    confidence=minions[minion_idx][2],
-                ))
-
-        return matched_minions
-
-    def annotate_minions(self, img, minions: list[Minion], line_thickness = 1, color = (0, 0, 255)):
-        annotator = Annotator(img, line_width=line_thickness)
-
-        for minion in minions:
-            label = f'{minion.minion_type} {minion.confidence:.2f}, health: {100*minion.health_level:.1f}%'
-            annotator.box_label(minion.bbox, label, color=color)
-
-        # Stream results
-        return annotator.result()
-    
-    def annotate_minions2(self, img, minions: list[Minion], colors:list, line_thickness = 1, annotate_health_level=True, annotate_detections=False):
-        annotator = Annotator(img, line_width=line_thickness, font_size=15)
-
-        if annotate_detections:
-            for i, minion_box in enumerate(minions):
-                annotator.box_label(minion_box, color=colors[i])
-        elif annotate_health_level:
-            for i, minion in enumerate(minions):
-                label = f'{minion.minion_type}, health: {100*minion.health_level:.1f}%'
-                annotator.box_label(minion.bbox, label, color=colors[i])
-        else:
-            for i, minion in enumerate(minions):
-                label = f'{minion.minion_type}'
-                annotator.box_label(minion.bbox, label, color=colors[i])
-
-        # Stream results
-        return annotator.result()
-    
-
-    def _get_intersected_area(self, health_bar_boxes, minion_boxes):
-    
-        # Compute intersection coordinates
-        x1_intersection = np.maximum(health_bar_boxes[:, 0][:, np.newaxis], minion_boxes[:, 0])
-        y1_intersection = np.maximum(health_bar_boxes[:, 1][:, np.newaxis], minion_boxes[:, 1])
-        x2_intersection = np.minimum(health_bar_boxes[:, 2][:, np.newaxis], minion_boxes[:, 2])
-        y2_intersection = np.minimum(health_bar_boxes[:, 3][:, np.newaxis], minion_boxes[:, 3])
-
-        # Compute intersection area
-        intersection_area = np.maximum(x2_intersection - x1_intersection, 0) * np.maximum(y2_intersection - y1_intersection, 0)
-
-        # Compute health bar and minion box areas
-        health_bar_areas = (health_bar_boxes[:, 2] - health_bar_boxes[:, 0]) * (health_bar_boxes[:, 3] - health_bar_boxes[:, 1])
-
-        # Compute IoU
-        intersection_ratio = np.where(health_bar_areas[:, np.newaxis] > 0, intersection_area / health_bar_areas[:, np.newaxis], 0)
-
-        # Filter IoU based on threshold
-        hbars_vs_minions_ious = np.where(intersection_ratio >= self.intersection_threshold, intersection_ratio, 0)
-
-        return hbars_vs_minions_ious
+    @staticmethod
+    def _get_intersected_area(health_bar_boxes, minion_boxes):
+        """Fraction of each health bar covered by each minion detection."""
+        x1 = np.maximum(health_bar_boxes[:, 0, None], minion_boxes[:, 0])
+        y1 = np.maximum(health_bar_boxes[:, 1, None], minion_boxes[:, 1])
+        x2 = np.minimum(health_bar_boxes[:, 2, None], minion_boxes[:, 2])
+        y2 = np.minimum(health_bar_boxes[:, 3, None], minion_boxes[:, 3])
+        intersection = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
+        areas = np.maximum(health_bar_boxes[:, 2] - health_bar_boxes[:, 0], 0) * np.maximum(
+            health_bar_boxes[:, 3] - health_bar_boxes[:, 1], 0
+        )
+        return np.divide(intersection, areas[:, None], out=np.zeros_like(intersection, dtype=float),
+                         where=areas[:, None] > 0)

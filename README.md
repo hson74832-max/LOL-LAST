@@ -1,57 +1,34 @@
-# League of Legends Last Hit Bot
+# League of Legends Last Hit Companion (Non-Injection)
 
-This repository contains the code for a bot designed to automate the last-hitting process in League of Legends. The bot utilizes object detection techniques to identify and prioritize minions for last hits. The entire development process, from initial concept to final results, is documented in a [YouTube video](https://www.youtube.com/watch?v=tHWoz6xyk7k). 
+This repository provides a **read-only, non-injection** visual companion for identifying and prioritizing last-hittable minions in League of Legends from desktop screen capture.
 
 ![](figures/futuristic.png)
 
-## Features
-- **Object Detection**: Uses [YOLOv9]([https://www.google.com/url?sa=t&source=web&rct=j&opi=89978449&url=https://github.com/WongKinYiu/yolov9&ved=2ahUKEwj9tLOFwoaIAxVwBNsEHRT7C3EQFnoECCAQAQ&usg=AOvVaw2dg0KGJMx_HkdUYJo6MPyS](https://github.com/WongKinYiu/yolov9)) for detecting minions.
-- **Customizable Parameters**: Allows customization of target minion color, screen resolution, and other parameters.
-- **Visualization**: Option to visualize the bot's decision-making process in real-time.
-
-## Installation
-
-1. Clone this repository:
-   
-```shell
-git clone https://github.com/cengineer13/last-hit-bot.git
-cd last-hit-bot
-```
-
-2. Install the required dependencies:
-   
-```shell
-pip install -r requirements.txt
-```
-
-Note: The requirements.txt includes a dependency on the YOLOv9 repository. Ensure that you have it set up correctly.
-
-3. Download the trained YOLOv9 weights from [this link](https://drive.google.com/file/d/135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo/view?usp=share_link) and place them in the appropriate directory.
-
+## Key Guarantees
+- **Zero Injection**: Performs **no** game process/memory reading or DLL injection, and **no** synthetic mouse/keyboard input (`pynput` removed).
+- **Only Last-Hittable Minions Shown**: Minions whose conservative upper-bound HP exceeds your configured effective attack damage—or whose detection/health-bar reading is ambiguous, clipped, or low-confidence—are excluded and never rendered.
+- **Minion Prioritization Preserved**: Eligible last-hittable minions are ranked by distance to the player anchor (`#1` nearest priority target highlighted in yellow, `#2+` secondary last-hittable minions in green), with deterministic tie-breaking by remaining HP upper bound and bounding box.
 
 ## Usage
 
-Run the bot using main.py:
-``` shell
-python main.py
+Run the companion using `main.py`:
+```bash
+python main.py --monitor_idx 1 --visualize True --minion_color red --H 540 --W 960 --effective_damage 80
+```
+
+Inspect available monitor indices:
+```bash
+python main.py --list-monitors
 ```
 
 ### Parameters
-- **`monitor_idx`**: The index of the monitor to capture screenshots from (0 for primary monitor).
-- **`visualize`**: Set to `True` to enable visualization, `False` to disable.
-- **`minion_color`**: Specify the color of minions to target (e.g., `blue`, `red`).
-- **`H`**: Half the height of the screen resolution.
-- **`W`**: Half the width of the screen resolution.
-
-
-Example:
-   ```bash
-   python main.py --monitor_idx 0 --visualize True --minion_color red --H 540 --W 960
-   ```
-## Contributing
-
-If you'd like to contribute, feel free to fork the repository and submit a pull request. Contributions, bug reports, and feature requests are welcome!
-
-## Acknowledgments
-
-[YOLOv9](https://docs.ultralytics.com/models/yolov9/) for the object detection framework.
+- `--monitor_idx`: Monitor index to capture screenshots from.
+- `--visualize` / `--no-visualize`: Enable or disable the read-only preview window.
+- `--minion_color`: Enemy minion color to evaluate (`red` or `blue`).
+- `--H`, `--W`: Target frame height and width.
+- `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage.
+- `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`: Conservative upper bounds on minion maximum HP.
+- `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.02`).
+- `--min_confidence`: Minimum detection confidence for minions and health bars (default `0.6`).
+- `--player_anchor`: Normalized `(x, y)` anchor in `[0, 1]` for distance prioritization (default `0.5 0.5`).
+- `--max_distance`: Optional maximum pixel distance from the player anchor.
