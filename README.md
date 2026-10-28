@@ -31,14 +31,14 @@ This script automatically:
 
 ## Usage
 
-On Windows, you can launch the companion using **`run.bat`** (which automatically uses `.venv` and installs requirements if needed):
+On Windows, you can launch the companion using **`run.bat`** (which automatically uses `.venv`, upgrades CPU-only PyTorch to CUDA PyTorch if an NVIDIA GPU is detected, and installs requirements if needed):
 ```bat
-run.bat --monitor_idx 1 --visualize True --minion_color red --H 540 --W 960 --effective_damage 80
+run.bat --monitor_idx 1 --visualize True --minion_color red --H 720 --W 1280 --effective_damage 80
 ```
 
 Or run `main.py` directly with Python:
 ```bash
-python main.py --monitor_idx 1 --visualize True --minion_color red --H 540 --W 960 --effective_damage 80
+python main.py --monitor_idx 1 --visualize True --minion_color red --H 720 --W 1280 --effective_damage 80
 ```
 
 Inspect available monitor indices:
@@ -50,7 +50,9 @@ python main.py --list-monitors
 - `--monitor_idx`: Monitor index to capture screenshots from.
 - `--visualize` / `--no-visualize`: Enable or disable the read-only preview window.
 - `--minion_color`: Enemy minion color to evaluate (`red` or `blue`).
-- `--H`, `--W`: Target frame height and width.
+- `--H`, `--W`: Target frame height and width (default `720` x `1280` for low latency).
+- `--imgsz`: YOLOv9 inference resolution (default `640` for low latency; `960` for maximum range).
+- `--sync`: Run capture and inference synchronously instead of the default low-latency asynchronous pipeline.
 - `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage.
 - `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`: Conservative upper bounds on minion maximum HP.
 - `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.0`).

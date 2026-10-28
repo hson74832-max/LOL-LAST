@@ -10,7 +10,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from main import build_arg_parser, process_frame
+from main import (
+    _AsyncDetectionWorker,
+    build_arg_parser,
+    evaluate_with_latest_detections,
+    process_frame,
+)
 from my_utils.data_structures.labels import normalize_label
 from my_utils.data_structures.minion import Minion
 from my_utils.loaders.frame_loader import (
@@ -519,3 +524,72 @@ def test_real_world_low_hp_minions_in_wave_with_low_bar_confidence_and_overlap()
     # Closest to center (200, 200) is Minion B at y=130..205, then Minion A at y=85..165
     assert candidates[0].minion.minion_type == "red caster minion"
     assert candidates[1].minion.minion_type == "red melee minion"
+
+
+def test_async_detection_worker_and_live_frame_health_reevaluation():
+    """Verify the async worker drops stale frames and live frames immediately update last-hit status."""
+    import time
+
+    # Frame 1: minion at 50% HP (not last-hittable)
+    frame_high_hp = np.zeros((300, 400, 3), dtype=np.uint8)
+    frame_high_hp[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=30, color="red")
+
+    # Frame 2 (live frame): same minion position, but health bar just dropped to ~13% HP (last-hittable!)
+    frame_low_hp = np.zeros((300, 400, 3), dtype=np.uint8)
+    frame_low_hp[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
+
+    class BoxDetector:
+        def __call__(self, _frame):
+            return {
+                "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+                "red_health_bars": [((100, 90, 160, 98), 0.89)],
+                "blue_minions": [],
+                "blue_health_bars": [],
+                "cur_object_counts": {},
+            }
+
+    worker = _AsyncDetectionWorker(BoxDetector())  # type: ignore[arg-type]
+    worker.start()
+    try:
+        cap1 = CapturedFrame(image=frame_high_hp, captured_at=1.0)
+        worker.submit(cap1)
+        for _ in range(50):
+            if worker.get_latest() is not None:
+                break
+            time.sleep(0.01)
+        assert worker.get_latest() is not None
+
+        settings = LastHitSettings(
+            effective_damage=77.0,
+            max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+        )
+        associator = ObjectAssociator()
+        advisor = LastHitAdvisor(settings)
+        annotator = AIAnnotator()
+
+        # On cap1 (50% HP = 150 HP > 77), minion is NOT last-hittable
+        candidates_1, _ = evaluate_with_latest_detections(
+            captured_frame=cap1,
+            latest_detection=worker.get_latest(),
+            object_associator=associator,
+            advisor=advisor,
+            annotator=annotator,
+            minion_color="red",
+        )
+        assert candidates_1 == []
+
+        # On cap2 (13% HP = 40 HP <= 77), using the already-available detection boxes on the live frame
+        # immediately identifies the minion as last-hittable without waiting for another YOLO pass!
+        cap2 = CapturedFrame(image=frame_low_hp.copy(), captured_at=1.05)
+        candidates_2, _ = evaluate_with_latest_detections(
+            captured_frame=cap2,
+            latest_detection=worker.get_latest(),
+            object_associator=associator,
+            advisor=advisor,
+            annotator=annotator,
+            minion_color="red",
+        )
+        assert len(candidates_2) == 1
+        assert candidates_2[0].health_upper_bound <= 77.0
+    finally:
+        worker.stop()

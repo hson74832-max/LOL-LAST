@@ -136,6 +136,8 @@ class HealthBarUtils:
         candidates: list[tuple[float, float]] = []
         native_match = self._match_single_scale(health_bar_img, template, bar_color)
         if native_match is not None:
+            if native_match[0] >= 0.80:
+                return native_match[1]
             candidates.append(native_match)
 
         for target_h in (4, 6, 8):
