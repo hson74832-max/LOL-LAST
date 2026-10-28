@@ -770,7 +770,7 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
     events = []
 
     class FakeOverlay:
-        def __init__(self, monitor, primary_width=None, marker_gap=16.0):
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0):
             self.closed = False
             events.append(("init", monitor["width"], primary_width, marker_gap))
 
@@ -1056,7 +1056,7 @@ def test_main_gates_markers_and_honours_confirm_frames(monkeypatch):
     rendered = []
 
     class FakeOverlay:
-        def __init__(self, monitor, primary_width=None, marker_gap=16.0):
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0):
             self.closed = False
 
         def render(self, candidates, frame_shape):
@@ -1447,6 +1447,7 @@ def test_debug_reporter_formats_prints_and_saves_annotated_frames(tmp_path, caps
     assert "--effective_damage" in out and hint
 
     saved = reporter.save(img, detection_result, [], force=True)
+    reporter.close()  # flush the background writer
     assert saved is not None and saved.exists() and saved.name == "latest.png"
     written = cv2.imread(str(saved))
     assert written is not None and written.shape == img.shape
@@ -1716,3 +1717,245 @@ def test_process_frame_reports_geometric_bars_in_debug_stats(capsys):
     reporter = DebugReporter(minion_color="red", interval=0.0)
     assert reporter.report(stats, force=True) is None  # markers exist -> no hint
     assert "geo bars=9" in capsys.readouterr().out
+
+
+def test_fps_limiter_and_stage_timer():
+    import time
+
+    from my_utils.modules.performance import FpsLimiter, StageTimer
+
+    assert FpsLimiter(0).sleep() == 0.0          # unlimited never sleeps
+    limiter = FpsLimiter(50)                     # 20 ms cadence
+    started = time.perf_counter()
+    for _ in range(6):
+        limiter.sleep()
+    elapsed = time.perf_counter() - started
+    assert 0.07 <= elapsed <= 0.35, elapsed      # ~5 intervals, never faster
+
+    with pytest.raises(ValueError):
+        FpsLimiter(-1)
+    with pytest.raises(ValueError):
+        FpsLimiter(float("nan"))
+
+    timer = StageTimer(window=2)
+    with timer.measure("capture"):
+        pass
+    timer.add("evaluate", 0.002)
+    timer.add("evaluate", 0.004)
+    timer.add("evaluate", 0.006)                 # window keeps the two newest
+    averages = timer.averages()
+    assert set(averages) == {"capture", "evaluate"}
+    assert averages["evaluate"] == pytest.approx(0.005)
+    assert "evaluate=5.0ms" in timer.format()
+    timer.add("evaluate", float("nan"))          # ignored
+    assert timer.averages()["evaluate"] == pytest.approx(0.005)
+    timer.reset()
+    assert timer.averages() == {} and timer.format() == ""
+
+
+def test_inference_pacing_limits_gpu_load():
+    """Detection must not run back-to-back: that is what makes the game stutter."""
+    import time
+
+    from main import _AsyncDetectionWorker
+
+    class CountingDetector:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _frame):
+            self.calls += 1
+            return {"red_minions": [], "red_health_bars": [],
+                    "blue_minions": [], "blue_health_bars": []}
+
+    frame = CapturedFrame(image=np.zeros((300, 400, 3), dtype=np.uint8), captured_at=1.0)
+
+    # Capped at 20 fps: ~0.35 s of submissions must yield well under 10 inferences.
+    detector = CountingDetector()
+    worker = _AsyncDetectionWorker(detector, max_fps=20)
+    worker.start()
+    try:
+        deadline = time.perf_counter() + 0.35
+        while time.perf_counter() < deadline:
+            worker.submit(frame)
+            time.sleep(0.002)
+        assert 3 <= detector.calls <= 9, detector.calls
+    finally:
+        worker.stop()
+
+    # Unlimited (default 0) keeps the old behaviour: many inferences in the same window.
+    detector = CountingDetector()
+    worker = _AsyncDetectionWorker(detector)
+    worker.start()
+    try:
+        deadline = time.perf_counter() + 0.2
+        while time.perf_counter() < deadline:
+            worker.submit(frame)
+            time.sleep(0.002)
+        assert detector.calls >= 10, detector.calls
+    finally:
+        worker.stop()
+
+    with pytest.raises(ValueError):
+        _AsyncDetectionWorker(CountingDetector(), max_fps=-5)
+
+
+def test_process_priority_and_torch_threads_are_optional_and_safe(monkeypatch):
+    import os
+    import types as _types
+
+    from my_utils.modules import performance
+
+    recorded = {}
+
+    class FakeProcess:
+        def nice(self, value):
+            recorded["nice"] = value
+
+    fake_psutil = _types.SimpleNamespace(
+        Process=lambda pid=None: FakeProcess(),
+        NORMAL_PRIORITY_CLASS=32,
+        BELOW_NORMAL_PRIORITY_CLASS=16384,
+        IDLE_PRIORITY_CLASS=64,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert "below" in performance.apply_process_priority("below")
+    assert recorded["nice"] == (16384 if os.name == "nt" else 10)
+    assert "lowest" in performance.apply_process_priority("lowest")
+    with pytest.raises(ValueError):
+        performance.apply_process_priority("realtime")
+
+    # psutil missing -> simply no priority change, no crash
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert performance.apply_process_priority("below") is None
+
+    # torch thread limiting (CPU inference)
+    monkeypatch.setitem(
+        sys.modules, "torch", _types.SimpleNamespace(set_num_threads=lambda n: recorded.update(threads=n))
+    )
+    assert "4" in performance.set_torch_threads(4)
+    assert recorded["threads"] == 4
+    with pytest.raises(ValueError):
+        performance.set_torch_threads(0)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert performance.set_torch_threads(2) is None
+
+
+def test_capture_tips_are_specific_to_the_configuration():
+    from my_utils.modules.performance import capture_and_processing_tips
+
+    big = "\n".join(capture_and_processing_tips(960, 2560, 1440))
+    assert "--imgsz 512" in big
+    assert "--H 720 --W 1280" in big
+    assert "--infer_fps 10" in big
+
+    small = "\n".join(capture_and_processing_tips(480, 960, 540))
+    assert "--imgsz 512" not in small          # already cheaper than that
+    assert "--H 720 --W 1280" not in small     # frame is small enough
+
+
+def test_cli_exposes_performance_flags():
+    from main import DEFAULT_INFER_FPS, DEFAULT_LOOP_FPS, DEFAULT_OVERLAY_FPS
+
+    parser = build_arg_parser()
+    defaults = parser.parse_args([])
+    assert defaults.infer_fps == DEFAULT_INFER_FPS
+    assert defaults.max_fps == DEFAULT_LOOP_FPS
+    assert defaults.overlay_fps == DEFAULT_OVERLAY_FPS
+    assert defaults.priority == "below"
+    assert defaults.torch_threads is None
+
+    tuned = parser.parse_args(
+        ["--infer_fps", "8", "--max_fps", "0", "--overlay_fps", "15",
+         "--priority", "lowest", "--torch_threads", "4"]
+    )
+    assert tuned.infer_fps == 8.0
+    assert tuned.max_fps == 0.0                # 0 = unlimited
+    assert tuned.overlay_fps == 15.0
+    assert tuned.priority == "lowest"
+    assert tuned.torch_threads == 4
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--infer_fps", "-3"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--priority", "realtime"])
+
+
+def test_debug_reporter_writes_off_the_main_thread(monkeypatch):
+    import time
+
+    from my_utils.modules.diagnostics import DebugReporter
+
+    img = np.full((200, 300, 3), 60, dtype=np.uint8)
+    detection_result = {"red_minions": [((10, 10, 40, 60), "red caster minion", 0.9)],
+                        "red_health_bars": []}
+    reporter = DebugReporter(frames_dir=None, interval=0.0)
+    assert reporter.save(img, detection_result, [], force=True) is None   # no dir -> no-op
+
+    reporter = DebugReporter(frames_dir="/tmp/lol-debug-async", interval=0.0, async_writes=True)
+    start = time.perf_counter()
+    path = reporter.save(img, detection_result, [], force=True)
+    elapsed = time.perf_counter() - start
+    assert path is not None
+    assert elapsed < 0.05, f"PNG encoding must not block the capture loop ({elapsed * 1000:.1f} ms)"
+    reporter.close()
+    assert path.exists()
+    # Closing twice is safe and later saves are ignored.
+    reporter.close()
+    assert reporter.save(img, detection_result, [], force=True) is None
+
+    # Synchronous mode is still available (useful for tests/one-shot dumps).
+    sync = DebugReporter(frames_dir="/tmp/lol-debug-sync", interval=0.0, async_writes=False)
+    path = sync.save(img, detection_result, [], force=True)
+    assert path is not None and path.exists()
+
+
+def test_main_loop_respects_max_fps(monkeypatch):
+    """--max_fps must actually throttle the capture loop (protects the game's CPU time)."""
+    import time
+
+    import main as main_module
+
+    iterations = []
+    frame = CapturedFrame(image=np.full((120, 160, 3), 40, dtype=np.uint8), captured_at=1.0)
+
+    class FakeFrameLoader:
+        monitor = {"left": 0, "top": 0, "width": 160, "height": 120}
+        primary_monitor = {"left": 0, "top": 0, "width": 160, "height": 120}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def grab(self, window_rect=None):
+            iterations.append(time.perf_counter())
+            if len(iterations) > 8:
+                raise KeyboardInterrupt
+            return frame
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, _img):
+            return {"red_minions": [], "red_health_bars": [],
+                    "blue_minions": [], "blue_health_bars": []}
+
+    monkeypatch.setattr(main_module, "FrameLoader", FakeFrameLoader)
+    monkeypatch.setattr(main_module, "Detector", FakeDetector)
+
+    started = time.perf_counter()
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(["--sync", "--no-overlay", "--no-visualize",
+                          "--max_fps", "25", "--infer_fps", "5"])
+    elapsed = time.perf_counter() - started
+
+    assert len(iterations) == 9
+    # 8 intervals at 25 fps ~= 0.32 s; the unlimited loop would finish in microseconds.
+    assert elapsed >= 0.2, elapsed

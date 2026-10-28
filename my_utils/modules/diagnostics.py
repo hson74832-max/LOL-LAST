@@ -8,6 +8,7 @@ plus an actionable hint, and can dump annotated debug frames to disk.
 It never changes detection results: it only observes.
 """
 
+import threading
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -69,7 +70,8 @@ def stats_from_frame(
     other = "blue" if minion_color == "red" else "red"
     brightness = 0.0
     if isinstance(image, np.ndarray) and image.size:
-        brightness = float(image.mean())
+        # Sub-sampled mean: same information, ~16x cheaper on a 1080p frame.
+        brightness = float(image[::4, ::4].mean())
 
     stats = FrameStats(
         brightness=brightness,
@@ -102,10 +104,14 @@ def _ms(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 1000:.0f}ms"
 
 
-def format_stats(stats: FrameStats, minion_color: str = "red") -> str:
+def format_stats(
+    stats: FrameStats,
+    minion_color: str = "red",
+    timings: dict | None = None,
+) -> str:
     """One compact line with everything needed to diagnose a missing marker."""
     health = ", ".join(f"{100 * h:.0f}%" for h in stats.health) or "-"
-    return (
+    line = (
         f"brightness={stats.brightness:.1f} | "
         f"{minion_color} bodies={stats.bodies} bars={stats.bars} | "
         f"other-color bodies={stats.other_color_bodies} bars={stats.other_color_bars} | "
@@ -114,6 +120,11 @@ def format_stats(stats: FrameStats, minion_color: str = "red") -> str:
         f"eligible={stats.eligible} drawn={stats.kept} | "
         f"infer={_ms(stats.inference_seconds)} box_age={_ms(stats.detection_age)}"
     )
+    if timings:
+        line += " | " + " ".join(
+            f"{name}={value * 1000:.1f}ms" for name, value in timings.items()
+        )
+    return line
 
 
 def no_marker_hint(stats: FrameStats, minion_color: str = "red") -> str | None:
@@ -248,26 +259,39 @@ class DebugReporter:
         frames_dir: str | Path | None = None,
         interval: float = 1.0,
         print_lines: bool = True,
+        async_writes: bool = True,
     ) -> None:
         self.minion_color = minion_color
         self.frames_dir = Path(frames_dir) if frames_dir else None
         self.interval = max(0.0, float(interval))
         self.print_lines = print_lines
+        # Encoding a 1280x720 PNG costs 15-25 ms; doing it on the capture loop shows up
+        # as a hitch in the game, so it is handed to a writer thread.
+        self.async_writes = bool(async_writes)
         self._last_print = 0.0
         self._last_save = 0.0
         self._last_hint: str | None = None
         self.last_saved_path: Path | None = None
+        self._pending_write: tuple[Path, np.ndarray] | None = None
+        self._write_condition = threading.Condition()
+        self._writer: threading.Thread | None = None
+        self._closed = False
         if self.frames_dir is not None:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
 
-    def report(self, stats: FrameStats, force: bool = False) -> str | None:
+    def report(
+        self,
+        stats: FrameStats,
+        force: bool = False,
+        timings: dict | None = None,
+    ) -> str | None:
         """Print the stats line + hint (rate limited). Returns the hint if it changed."""
         now = monotonic()
         hint = no_marker_hint(stats, self.minion_color)
         hint_changed = hint != self._last_hint
         if self.print_lines and (force or hint_changed or now - self._last_print >= self.interval):
             self._last_print = now
-            print(f"[DEBUG] {format_stats(stats, self.minion_color)}")
+            print(f"[DEBUG] {format_stats(stats, self.minion_color, timings)}")
             if hint:
                 print(f"[DEBUG] no markers: {hint}")
         self._last_hint = hint
@@ -294,11 +318,50 @@ class DebugReporter:
         except Exception:
             return None
         path = self.frames_dir / "latest.png"
-        try:
-            ok = cv2.imwrite(str(path), annotated)
-        except Exception:
-            return None
-        if not ok:
-            return None
         self.last_saved_path = path
+        if not self.async_writes:
+            try:
+                return path if cv2.imwrite(str(path), annotated) else None
+            except Exception:
+                return None
+        with self._write_condition:
+            if self._closed:
+                return None
+            self._pending_write = (path, annotated)
+            if self._writer is None:
+                self._writer = threading.Thread(
+                    target=self._write_loop, name="LastHitDebugWriter", daemon=True
+                )
+                self._writer.start()
+            self._write_condition.notify()
         return path
+
+    def _write_loop(self) -> None:
+        while True:
+            with self._write_condition:
+                while self._pending_write is None and not self._closed:
+                    self._write_condition.wait()
+                if self._pending_write is None:
+                    return
+                path, image = self._pending_write
+                self._pending_write = None
+            try:
+                cv2.imwrite(str(path), image)
+            except Exception:
+                pass
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Flush a pending debug frame and stop the writer thread."""
+        with self._write_condition:
+            self._closed = True
+            pending = self._pending_write
+            self._pending_write = None
+            self._write_condition.notify_all()
+        if pending is not None:
+            try:
+                cv2.imwrite(str(pending[0]), pending[1])
+            except Exception:
+                pass
+        writer = self._writer
+        if writer is not None and writer.is_alive():
+            writer.join(timeout=timeout)
