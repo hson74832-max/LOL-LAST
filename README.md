@@ -93,6 +93,38 @@ Check the first lines of console output, they state the device explicitly, e.g.:
 [INFO] Detector initialized on device=privateuseone:0 [DirectML] (fp16=False, imgsz=(640, 640))
 ```
 
+## HP numbers above minions, and keeping a marker until the minion dies
+Every marker now carries the **estimated remaining HP** of that minion, on the overlay and in the preview window:
+
+| Flag | Default | Result above a marker |
+| --- | --- | --- |
+| `--overlay_labels` / `--no-overlay_labels` | on | show/hide the number |
+| `--overlay_label_mode hp` | ✔ | `58 HP` |
+| `--overlay_label_mode hp_damage` | | `58/80` — remaining HP vs. your damage, i.e. the kill margin |
+| `--overlay_label_mode percent` | | `19%` |
+| `--hold_ms` | `250` | keep a confirmed marker this long after the minion stops being detected |
+
+Held markers keep the **last position and last HP reading** and are drawn dimmed/dashed with a `?` (`58 HP?`) so a stale reading is never mistaken for a live one. They are never invented: only minions that were already confirmed get held, hold time is capped by `--hold_ms` (set `0` to disable), and the marker disappears as soon as the grace period ends — so a dead minion never keeps a marker for more than `--hold_ms`.
+
+Remaining HP is computed as `health_fraction × max HP of that minion type` using `--caster_max_hp` / `--melee_max_hp` / `--siege_max_hp`, and it is deliberately an **upper bound**. That is why the label is an estimate: a minion showing `58 HP` with `--effective_damage 80` is safe to hit, one showing `84 HP` is not marked at all.
+
+## Why the companion cannot read your AD/AP
+The champion's attack damage / ability power is **not** visible on screen (the scoreboard shows items and KDA, not AD/AP), and reading it would require reading the game's memory or process — exactly what this project guarantees it never does (`Zero Injection` above). There is no reliable OCR path either: the value changes with level, items, runes and buffs, and never appears as a number in the HUD.
+
+So the damage value is an explicit, conservative input:
+
+```bat
+:: your post-mitigation basic-attack damage on minions (AD + on-hit, minus minion armor)
+run.bat --effective_damage 80 --overlay_label_mode hp_damage
+```
+
+How to pick it quickly:
+1. Hit a minion once and watch the number on `--debug` (or the overlay) before/after — the drop is your effective damage.
+2. Or take your in-game AD and subtract ~0–10 for minion armor; on-hit effects (Sheen, Kraken, Doran's) add to it.
+3. Abilities are intentionally ignored: last-hit timing from a basic attack is what this tool predicts.
+
+If you set `--effective_damage` too high, non-killable minions get marked; the conservative upper-bound HP reading makes that unlikely but not impossible, so keep it at what you *actually* deal, not your theoretical maximum.
+
 ## Missing health bars no longer hide minions
 YOLOv9's `*_health_bar` class is the weakest link in a real fight: reports of 8–9 detected minion bodies with 0–2 detected bars are common, and without a bar a minion can never be associated, so **no marker can be drawn at all**.
 
@@ -244,6 +276,9 @@ Last-hit maths:
 - `--infer_fps`: Maximum YOLO inferences per second (default `12`, `0` = unlimited).
 - `--max_fps`: Maximum capture/processing frames per second (default `30`, `0` = unlimited).
 - `--overlay_fps`: Maximum overlay redraws per second (default `30`).
+- `--overlay_labels` / `--no-overlay_labels`: Show the estimated remaining HP above each marker (default on).
+- `--overlay_label_mode`: `hp` (default), `hp_damage` (`HP/damage` margin) or `percent`.
+- `--hold_ms`: Keep a confirmed marker this long after its minion disappears (default `250`; `0` disables).
 - `--priority`: This process' priority: `normal`, `below` (default) or `lowest`.
 - `--torch_threads`: Limit PyTorch intra-op threads (CPU inference).
 - `--stale_frame_fallback`: Re-enable the legacy previous-frame fallback (off by default).

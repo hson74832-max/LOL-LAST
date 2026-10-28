@@ -26,6 +26,7 @@ from my_utils.modules.performance import (
 )
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.modules.stability import CandidateGate
+from my_utils.modules.tracking import MinionTracker
 from my_utils.visualizers.annotator import AIAnnotator
 from my_utils.visualizers.overlay import (
     DEFAULT_MARKER_GAP,
@@ -42,6 +43,8 @@ DEFAULT_MAX_DETECTION_AGE = 0.35
 DEFAULT_INFER_FPS = 12.0
 DEFAULT_LOOP_FPS = 30.0
 DEFAULT_OVERLAY_FPS = 30.0
+# Confirmed markers are held this long while a minion's health bar flickers.
+DEFAULT_HOLD_MS = 250.0
 DEFAULT_CONFIRM_FRAMES = 2
 DEFAULT_BAR_MIN_CONFIDENCE = 0.20
 
@@ -332,6 +335,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--hold_ms",
+        type=_non_negative_float,
+        default=DEFAULT_HOLD_MS,
+        help=(
+            "Keep a confirmed marker for this many milliseconds after its minion stops "
+            f"being detected (default {DEFAULT_HOLD_MS:.0f}; 0 disables holding). This stops "
+            "a nearly-dead minion's marker from blinking off while its 2px health bar is "
+            "unreadable. Held markers keep the last HP reading and are drawn dimmed."
+        ),
+    )
+    parser.add_argument(
+        "--overlay_labels",
+        nargs="?",
+        const=True,
+        default=True,
+        type=_parse_bool,
+        help=(
+            "Show the estimated remaining HP number above each marker on the desktop "
+            "overlay (default True). Disable with --no-overlay_labels."
+        ),
+    )
+    parser.add_argument(
+        "--no-overlay_labels",
+        dest="overlay_labels",
+        action="store_false",
+        help="Hide the HP numbers on the desktop overlay.",
+    )
+    parser.add_argument(
+        "--overlay_label_mode",
+        choices=("hp", "hp_damage", "percent"),
+        default="hp",
+        help=(
+            "'hp' shows the estimated remaining HP (default), 'hp_damage' shows "
+            "'HP/your damage' so the kill margin is visible, 'percent' shows the bar "
+            "percentage."
+        ),
+    )
+    parser.add_argument(
         "--bar_locator",
         nargs="?",
         const=True,
@@ -489,6 +530,7 @@ def process_frame(
     minion_color: str = "red",
     gate: CandidateGate | None = None,
     pipeline_stats: dict | None = None,
+    tracker: MinionTracker | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Evaluate a single frame and return (prioritized_last_hit_candidates, visualized_frame)."""
     detection_result = detector(captured_frame.image)
@@ -511,8 +553,14 @@ def process_frame(
         candidates = gate.update(
             candidates, captured_frame.image.shape, generation=captured_frame
         )
+    if tracker is not None:
+        # Frame timestamps are monotonic, so hold timing survives a stalled loop.
+        candidates = tracker.update(
+            candidates, captured_frame.image.shape, now=captured_frame.captured_at
+        )
     if pipeline_stats is not None:
         pipeline_stats["kept"] = len(candidates)
+        pipeline_stats["held"] = sum(1 for c in candidates if c.held)
     visualized = (
         annotator(candidates=candidates, img=captured_frame.image)
         if annotator is not None
@@ -545,6 +593,7 @@ def evaluate_with_latest_detections(
     max_detection_age: float | None = DEFAULT_MAX_DETECTION_AGE,
     allow_stale_frame_fallback: bool = False,
     pipeline_stats: dict | None = None,
+    tracker: MinionTracker | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Re-evaluate health bars on the live frame using the newest detector boxes.
 
@@ -560,6 +609,8 @@ def evaluate_with_latest_detections(
         )
         if gate is not None:
             gate.reset()
+        if tracker is not None:
+            tracker.reset()
         if pipeline_stats is not None:
             pipeline_stats.update(matched=0, eligible=0, kept=0, health=[], stale=True)
         return [], visualized
@@ -607,8 +658,14 @@ def evaluate_with_latest_detections(
         candidates = gate.update(
             candidates, captured_frame.image.shape, generation=det_frame
         )
+    if tracker is not None:
+        # Held markers are re-read against the live frame, so their HP stays current.
+        candidates = tracker.update(
+            candidates, captured_frame.image.shape, now=captured_frame.captured_at
+        )
     if pipeline_stats is not None:
         pipeline_stats["kept"] = len(candidates)
+        pipeline_stats["held"] = sum(1 for c in candidates if c.held)
     # The live frame was just handed to the detection worker; annotating it in
     # place would let YOLOv9 read half-drawn boxes, so always render on a copy.
     visualized = (
@@ -700,11 +757,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     advisor = LastHitAdvisor(settings)
     gate = CandidateGate(confirm_frames=args.confirm_frames)
+    tracker = MinionTracker(hold_ms=args.hold_ms)
     print(
         f"[INFO] Markers require {args.confirm_frames} consecutive frame(s); detector boxes "
         f"older than {args.max_detection_age * 1000:.0f} ms are ignored; "
         f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}; "
-        f"geometric health-bar reading {'on' if args.bar_locator else 'off'}."
+        f"geometric health-bar reading {'on' if args.bar_locator else 'off'}; "
+        f"markers held {args.hold_ms:.0f} ms after a minion disappears."
     )
     print(
         f"[INFO] Pacing: capture loop {args.max_fps or 'unlimited'} fps, detection "
@@ -812,6 +871,7 @@ def main(argv: list[str] | None = None) -> int:
                         max_detection_age=args.max_detection_age,
                         allow_stale_frame_fallback=args.stale_frame_fallback,
                         pipeline_stats=pipeline_stats,
+                        tracker=tracker,
                     )
                 else:
                     candidates, visualized = process_frame(
@@ -823,6 +883,7 @@ def main(argv: list[str] | None = None) -> int:
                         minion_color=args.minion_color,
                         gate=gate,
                         pipeline_stats=pipeline_stats,
+                        tracker=tracker,
                     )
 
                 timings.add("evaluate", time.perf_counter() - evaluate_started)
@@ -859,6 +920,9 @@ def main(argv: list[str] | None = None) -> int:
                             primary_width=frame_loader.primary_monitor["width"],
                             marker_gap=args.overlay_gap,
                             max_fps=args.overlay_fps or 60.0,
+                            show_labels=args.overlay_labels,
+                            label_mode=args.overlay_label_mode,
+                            damage=settings.effective_damage,
                         )
                     except (OverlayUnavailable, ValueError) as exc:
                         overlay_failed = True

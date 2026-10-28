@@ -9,6 +9,8 @@ from my_utils.modules.last_hitter import LastHitCandidate
 
 PRIMARY_TARGET_COLOR = (0, 255, 255)   # Yellow (BGR) for #1 priority last-hit target
 SECONDARY_TARGET_COLOR = (0, 200, 0)   # Green (BGR) for #2+ last-hittable minions
+HELD_PRIMARY_COLOR = (0, 184, 184)     # Dimmed yellow: marker held, minion not detected
+HELD_SECONDARY_COLOR = (0, 150, 0)     # Dimmed green
 TEXT_COLOR = (0, 0, 0)
 
 
@@ -61,13 +63,18 @@ class AIAnnotator:
             if x1 >= x2 or y1 >= y2:
                 continue
 
-            color = PRIMARY_TARGET_COLOR if priority_rank == 1 else SECONDARY_TARGET_COLOR
-            thickness = self.line_thickness + (1 if priority_rank == 1 else 0)
+            held = bool(getattr(candidate, "held", False))
+            if priority_rank == 1:
+                color = HELD_PRIMARY_COLOR if held else PRIMARY_TARGET_COLOR
+            else:
+                color = HELD_SECONDARY_COLOR if held else SECONDARY_TARGET_COLOR
+            thickness = self.line_thickness + (1 if priority_rank == 1 and not held else 0)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
 
             label = (
                 f"#{priority_rank} {minion.minion_type} "
                 f"<= {candidate.health_upper_bound:.0f} HP ({100 * minion.health_level:.0f}%)"
+                + (" [held]" if held else "")
             )
             (text_w, text_h), baseline = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
