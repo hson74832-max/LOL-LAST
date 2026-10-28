@@ -8,6 +8,7 @@ from scipy.optimize import linear_sum_assignment
 
 from my_utils.data_structures.labels import normalize_label
 from my_utils.data_structures.minion import Minion
+from my_utils.modules.bar_locator import HealthBarLocator
 from my_utils.modules.utils.health_bar_utils import HealthBarUtils
 
 
@@ -70,6 +71,8 @@ class ObjectAssociator:
         ambiguity_margin=0.05,
         health_bar_utils=None,
         bar_min_confidence=0.20,
+        bar_locator=None,
+        fallback_to_locator=True,
     ):
         for name, value in (
             ("intersection threshold", intersection_threshold),
@@ -91,6 +94,11 @@ class ObjectAssociator:
         self.bar_min_confidence = bar_min_confidence
         self.ambiguity_margin = ambiguity_margin
         self.health_bar_utils = health_bar_utils or HealthBarUtils()
+        # YOLOv9 regularly misses health bars in a wave; the locator reads the bar
+        # geometrically around each detected body instead of dropping the minion.
+        self.bar_locator = bar_locator if bar_locator is not None else HealthBarLocator()
+        self.fallback_to_locator = bool(fallback_to_locator)
+        self.last_stats = {"yolo_matches": 0, "fallback_matches": 0}
 
     def __call__(self, detection_result, img, minion_type="red", excluded_regions=()):
         if minion_type not in {"red", "blue"}:
@@ -143,10 +151,15 @@ class ObjectAssociator:
             raise ValueError("frame must be a BGR image")
         if minion_color not in {"red", "blue"}:
             raise ValueError("minion color must be red or blue")
+        self.last_stats = {"yolo_matches": 0, "fallback_matches": 0}
         bodies = self._prepare(minions, img.shape, minion_color, False, excluded_regions)
         bars = self._prepare(health_bars, img.shape, minion_color, True, excluded_regions)
-        if not bodies or not bars:
+        if not bodies:
             return []
+        if not bars:
+            if not self.fallback_to_locator:
+                return []
+            return self._locate_around_bodies(bodies, img, minion_color, [])
 
         bar_boxes = np.asarray([bar.bbox for bar in bars], dtype=float)
         body_boxes = np.asarray([body.bbox for body in bodies], dtype=float)
@@ -176,6 +189,8 @@ class ObjectAssociator:
         unassigned_bodies = [j for j in range(len(bodies)) if j not in assigned_bodies]
 
         matched = []
+        matched_body_indices = set()
+        matched_bar_boxes = []
         for bar_idx, body_idx in matched_pairs:
             score = effective_scores[bar_idx, body_idx]
             competing_bodies = [
@@ -207,7 +222,52 @@ class ObjectAssociator:
             if not isfinite(health) or not 0 < health <= 1:
                 continue
             matched.append(Minion(body.label, health, body.bbox, body.confidence))
+            matched_body_indices.add(body_idx)
+            matched_bar_boxes.append(bar.bbox)
+
+        self.last_stats["yolo_matches"] = len(matched)
+        if self.fallback_to_locator:
+            # Bars YOLOv9 reported but the ambiguity rules refused stay refused: never
+            # re-derive a bar geometrically for a body that was intentionally dropped.
+            matched.extend(
+                self._locate_around_bodies(
+                    bodies,
+                    img,
+                    minion_color,
+                    matched_bar_boxes + [bar.bbox for bar in bars],
+                    matched_body_indices,
+                )
+            )
         return matched
+
+    def _locate_around_bodies(
+        self,
+        bodies,
+        img,
+        minion_color,
+        used_bar_boxes,
+        used_body_indices=(),
+    ):
+        """Read health bars geometrically for bodies YOLOv9 gave no bar for."""
+        if self.bar_locator is None:
+            return []
+        used = list(used_bar_boxes)
+        extra = []
+        for body_idx, body in enumerate(bodies):
+            if body_idx in used_body_indices:
+                continue
+            try:
+                reading = self.bar_locator.locate(img, body.bbox, bar_color=minion_color)
+            except (TypeError, ValueError):
+                continue
+            if reading is None:
+                continue
+            if any(_box_iou(reading.box, box) > 0.5 for box in used):
+                continue
+            used.append(reading.box)
+            extra.append(Minion(body.label, reading.level, body.bbox, body.confidence))
+        self.last_stats["fallback_matches"] = len(extra)
+        return extra
 
     @staticmethod
     def _get_intersected_area(health_bar_boxes, minion_boxes):

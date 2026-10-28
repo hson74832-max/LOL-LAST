@@ -35,6 +35,8 @@ class FrameStats:
     other_color_bodies: int = 0
     other_color_bars: int = 0
     matched: int = 0
+    yolo_matches: int = 0
+    locator_matches: int = 0
     eligible: int = 0
     kept: int = 0
     health: list[float] = field(default_factory=list)
@@ -76,6 +78,8 @@ def stats_from_frame(
         other_color_bodies=_count(detection_result, f"{other}_minions"),
         other_color_bars=_count(detection_result, f"{other}_health_bars"),
         matched=int(pipeline.get("matched", 0)),
+        yolo_matches=int(pipeline.get("yolo_matches", 0)),
+        locator_matches=int(pipeline.get("fallback_matches", 0)),
         eligible=int(pipeline.get("eligible", 0)),
         kept=int(pipeline.get("kept", 0)),
         health=[float(v) for v in pipeline.get("health", []) if isfinite(float(v))],
@@ -86,8 +90,12 @@ def stats_from_frame(
     return stats
 
 
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+def _plural(count: int, noun: str, plural: str | None = None) -> str:
+    if count == 1:
+        return f"{count} {noun}"
+    if plural is None:
+        plural = f"{noun[:-1]}ies" if noun.endswith("y") else f"{noun}s"
+    return f"{count} {plural}"
 
 
 def _ms(value: float | None) -> str:
@@ -101,7 +109,8 @@ def format_stats(stats: FrameStats, minion_color: str = "red") -> str:
         f"brightness={stats.brightness:.1f} | "
         f"{minion_color} bodies={stats.bodies} bars={stats.bars} | "
         f"other-color bodies={stats.other_color_bodies} bars={stats.other_color_bars} | "
-        f"matched={stats.matched} hp=[{health}] | "
+        f"matched={stats.matched} (yolo bars={stats.yolo_matches}, "
+        f"geo bars={stats.locator_matches}) hp=[{health}] | "
         f"eligible={stats.eligible} drawn={stats.kept} | "
         f"infer={_ms(stats.inference_seconds)} box_age={_ms(stats.detection_age)}"
     )
@@ -139,18 +148,12 @@ def no_marker_hint(stats: FrameStats, minion_color: str = "red") -> str | None:
             "(and --debug to save annotated frames)."
         )
 
-    if stats.bodies > 0 and stats.bars == 0:
+    if stats.bodies > 0 and stats.matched == 0:
         return (
-            f"{_plural(stats.bodies, 'minion body')} detected but no health bars. "
-            "Health bars score lower than bodies: lower --min_bar_confidence (try 0.15) or "
-            "raise --imgsz 960 for small bars."
-        )
-
-    if stats.matched == 0:
-        return (
-            f"{_plural(stats.bodies, 'body')} and {_plural(stats.bars, 'bar')} were detected "
-            "but none were matched to each other. Usually a confidence/imgsz issue: try "
-            "--min_confidence 0.2 --min_bar_confidence 0.15 --imgsz 960."
+            f"{_plural(stats.bodies, 'minion body', 'minion bodies')} detected but no readable "
+            f"health bar was found for them ({_plural(stats.bars, 'YOLOv9 bar')}, no geometric "
+            "reading either). If YOLOv9 reports no bars, lower --min_bar_confidence (0.15); for "
+            "small or overlapping bars raise --imgsz 960. Check frames/debug/latest.png."
         )
 
     if stats.eligible == 0:
