@@ -659,12 +659,17 @@ def test_overlay_marker_geometry_and_monitor_mapping():
     class _FakeCanvas:
         def __init__(self):
             self.polygons = []
+            self.texts = []
 
         def delete(self, *_args):
             self.polygons.clear()
+            self.texts.clear()
 
         def create_polygon(self, *coords, **kwargs):
             self.polygons.append((coords, kwargs))
+
+        def create_text(self, *coords, **kwargs):
+            self.texts.append((coords, kwargs))
 
     class _FakeRoot:
         def update(self):
@@ -676,6 +681,9 @@ def test_overlay_marker_geometry_and_monitor_mapping():
     overlay.monitor_width = 1920
     overlay.monitor_height = 1080
     overlay.marker_gap = 16.0
+    overlay.show_labels = True
+    overlay.label_font = ("Segoe UI", 9, "bold")
+    overlay.label_offset = 6.0
     overlay._display_scale = 1.0
     overlay._max_interval = 0.0
     overlay._last_render = 0.0
@@ -770,7 +778,8 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
     events = []
 
     class FakeOverlay:
-        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0):
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0,
+                     show_labels=True, label_mode="hp", damage=None):
             self.closed = False
             events.append(("init", monitor["width"], primary_width, marker_gap))
 
@@ -1056,8 +1065,11 @@ def test_main_gates_markers_and_honours_confirm_frames(monkeypatch):
     rendered = []
 
     class FakeOverlay:
-        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0):
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0, max_fps=30.0,
+                     show_labels=True, label_mode="hp", damage=None):
             self.closed = False
+            assert label_mode in {"hp", "hp_damage", "percent"}
+            assert damage is None or damage > 0
 
         def render(self, candidates, frame_shape):
             rendered.append(len(candidates))
@@ -1959,3 +1971,268 @@ def test_main_loop_respects_max_fps(monkeypatch):
     assert len(iterations) == 9
     # 8 intervals at 25 fps ~= 0.32 s; the unlimited loop would finish in microseconds.
     assert elapsed >= 0.2, elapsed
+
+
+def _candidate(x, y, hp=40.0, kind="red caster minion", health=0.13, held=False):
+    return LastHitCandidate(
+        minion=Minion(kind, health, (x, y, x + 40, y + 60), 0.9),
+        health_upper_bound=hp,
+        distance=1.0,
+        held=held,
+    )
+
+
+def test_minion_tracker_holds_and_then_drops_markers():
+    from my_utils.modules.tracking import MinionTracker
+
+    with pytest.raises(ValueError):
+        MinionTracker(hold_ms=-1)
+    with pytest.raises(ValueError):
+        MinionTracker(hold_ms=float("inf"))
+
+    tracker = MinionTracker(hold_ms=250)
+    first = _candidate(100, 100, hp=39)
+    other = _candidate(400, 100, hp=52, kind="red melee minion")
+    shape = (300, 800, 3)
+
+    # Visible candidates are passed straight through, not flagged as held.
+    now = 10.0
+    out = tracker.update([first, other], shape, now=now)
+    assert [c.held for c in out] == [False, False]
+    assert tracker.track_count == 2
+
+    # One frame where the (nearly dead) minion's bar is unreadable: the marker is held
+    # with its LAST reading so the player can still hit it.
+    out = tracker.update([other], shape, now=now + 0.1)
+    assert sorted(c.held for c in out) == [False, True]
+    held = [c for c in out if c.held][0]
+    assert held.health_upper_bound == pytest.approx(39)
+    assert held.minion.bbox == first.minion.bbox
+
+    # Still held just before the deadline ...
+    out = tracker.update([], shape, now=now + 0.24)
+    assert len(out) == 2 and all(c.held for c in out)
+
+    # ... and gone once the grace period expired (no corpse markers).
+    out = tracker.update([], shape, now=now + 0.40)
+    assert out == []
+    assert tracker.track_count == 0
+
+    # hold_ms=0 disables holding entirely.
+    instant = MinionTracker(hold_ms=0)
+    instant.update([first], shape, now=1.0)
+    assert instant.update([], shape, now=1.001) == []
+
+
+def test_minion_tracker_keeps_neighbours_apart():
+    from my_utils.modules.tracking import MinionTracker
+
+    tracker = MinionTracker(hold_ms=250)
+    left = _candidate(100, 100, hp=30)
+    right = _candidate(175, 100, hp=80, health=0.27)
+    tracker.update([left, right], (300, 400, 3), now=1.0)
+
+    # Only the left minion survives; its held marker must keep the LEFT HP reading.
+    out = tracker.update([right], (300, 400, 3), now=1.05)
+    held = [c for c in out if c.held]
+    assert len(held) == 1
+    assert held[0].minion.bbox == left.minion.bbox
+    assert held[0].health_upper_bound == pytest.approx(30)
+
+
+def test_overlay_draws_hp_labels_and_dashes_held_markers():
+    from my_utils.visualizers.overlay import DesktopOverlay
+
+    class _Canvas:
+        def __init__(self):
+            self.polygons, self.texts = [], []
+
+        def delete(self, *_a):
+            self.polygons.clear()
+            self.texts.clear()
+
+        def create_polygon(self, *coords, **kwargs):
+            self.polygons.append((coords, kwargs))
+
+        def create_text(self, *coords, **kwargs):
+            self.texts.append((coords, kwargs))
+
+    overlay = DesktopOverlay.__new__(DesktopOverlay)
+    overlay.monitor_left = overlay.monitor_top = 0
+    overlay.monitor_width, overlay.monitor_height = 1920, 1080
+    overlay.marker_gap = 16.0
+    overlay.show_labels = True
+    overlay.label_font = ("Segoe UI", 9, "bold")
+    overlay.label_offset = 6.0
+    overlay._display_scale = 1.0
+    overlay._max_interval = 0.0
+    overlay._last_render = 0.0
+    overlay._closed = False
+    overlay._tkinter = None
+    overlay._root = type("R", (), {"update": lambda self: None})()
+    overlay._canvas = _Canvas()
+
+    live = _candidate(960, 500, hp=57)
+    held = _candidate(480, 500, hp=33, held=True)
+    overlay.render([live, held], (1080, 1920, 3))
+
+    labels = [kwargs["text"] for _, kwargs in overlay._canvas.texts]
+    assert labels == ["57 HP", "33 HP?"]          # '?' marks an expired reading
+    polygons = [kwargs for _, kwargs in overlay._canvas.polygons]
+    assert polygons[0]["dash"] == ()
+    assert polygons[1]["dash"] == (2, 2)
+    from my_utils.visualizers.overlay import HELD_SECONDARY_COLOR
+
+    assert polygons[1]["fill"] == HELD_SECONDARY_COLOR
+
+    # Labels can be switched off entirely.
+    overlay.show_labels = False
+    overlay._max_interval = 0.0
+    overlay.render([live], (1080, 1920, 3))
+    assert overlay._canvas.texts == []
+
+
+def test_annotator_marks_held_candidates(capsys=None):
+    from my_utils.visualizers.annotator import HELD_PRIMARY_COLOR
+
+    frame = np.zeros((400, 400, 3), dtype=np.uint8)
+    held = _candidate(180, 180, hp=33, held=True)
+    rendered = AIAnnotator()(candidates=[held], img=frame)
+    assert tuple(rendered[180, 200]) == HELD_PRIMARY_COLOR
+    assert not np.array_equal(rendered, frame)
+
+
+def test_cli_exposes_hold_and_label_flags():
+    parser = build_arg_parser()
+    defaults = parser.parse_args([])
+    assert defaults.hold_ms == 250.0
+    assert defaults.overlay_labels is True
+
+    tuned = parser.parse_args(["--hold_ms", "400", "--no-overlay_labels"])
+    assert tuned.hold_ms == 400.0
+    assert tuned.overlay_labels is False
+    assert parser.parse_args(["--overlay_labels", "False"]).overlay_labels is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--hold_ms", "-5"])
+
+
+def test_hold_survives_a_dropped_detection_in_the_pipeline():
+    """A minion seen, then missed for one frame, must keep its marker (then drop)."""
+    from my_utils.modules.tracking import MinionTracker
+
+    settings = LastHitSettings(
+        effective_damage=80.0, max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0}
+    )
+    img = np.full((300, 400, 3), 45, dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
+
+    detections = {
+        "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+        "red_health_bars": [((100, 90, 160, 98), 0.89)],
+        "blue_minions": [],
+        "blue_health_bars": [],
+    }
+    empty = {"red_minions": [], "red_health_bars": [],
+             "blue_minions": [], "blue_health_bars": []}
+
+    tracker = MinionTracker(hold_ms=250)
+    associator = ObjectAssociator()
+    advisor = LastHitAdvisor(settings)
+
+    frame = CapturedFrame(image=img.copy(), captured_at=10.0)
+    candidates, _ = evaluate_with_latest_detections(
+        captured_frame=frame,
+        latest_detection=(frame, detections),
+        object_associator=associator,
+        advisor=advisor,
+        tracker=tracker,
+        gate=None,
+    )
+    assert len(candidates) == 1 and candidates[0].held is False
+    hp = candidates[0].health_upper_bound
+    assert 0 < hp <= 80
+
+    # Next detector result shows nothing (bar unreadable for a moment): marker held.
+    frame2 = CapturedFrame(image=img.copy(), captured_at=10.1)
+    held, _ = evaluate_with_latest_detections(
+        captured_frame=frame2,
+        latest_detection=(frame2, empty),
+        object_associator=associator,
+        advisor=advisor,
+        tracker=tracker,
+        gate=None,
+    )
+    assert len(held) == 1 and held[0].held is True
+    assert held[0].health_upper_bound == pytest.approx(hp)
+
+    # Minion actually died / vanished for longer -> marker disappears.
+    frame3 = CapturedFrame(image=img.copy(), captured_at=10.5)
+    gone, _ = evaluate_with_latest_detections(
+        captured_frame=frame3,
+        latest_detection=(frame3, empty),
+        object_associator=associator,
+        advisor=advisor,
+        tracker=tracker,
+        gate=None,
+    )
+    assert gone == []
+
+
+def test_overlay_label_modes_show_hp_damage_margin():
+    from my_utils.visualizers.overlay import DesktopOverlay
+
+    class _Canvas:
+        def __init__(self):
+            self.texts = []
+
+        def delete(self, *_a):
+            self.texts.clear()
+
+        def create_polygon(self, *a, **k):
+            pass
+
+        def create_text(self, *a, **k):
+            self.texts.append(k["text"])
+
+    def make(mode, damage=None):
+        overlay = DesktopOverlay.__new__(DesktopOverlay)
+        overlay.monitor_left = overlay.monitor_top = 0
+        overlay.monitor_width, overlay.monitor_height = 1920, 1080
+        overlay.marker_gap = 16.0
+        overlay.show_labels = True
+        overlay.label_font = ("Segoe UI", 9, "bold")
+        overlay.label_offset = 6.0
+        overlay.label_mode = mode
+        overlay.damage = damage
+        overlay._display_scale = 1.0
+        overlay._max_interval = 0.0
+        overlay._last_render = 0.0
+        overlay._closed = False
+        overlay._tkinter = None
+        overlay._root = type("R", (), {"update": lambda self: None})()
+        overlay._canvas = _Canvas()
+        return overlay
+
+    candidate = _candidate(960, 500, hp=58, health=0.193)
+    overlay = make("hp")
+    overlay.render([candidate], (1080, 1920, 3))
+    assert overlay._canvas.texts == ["58 HP"]
+
+    overlay = make("hp_damage", damage=80.0)
+    overlay.render([candidate], (1080, 1920, 3))
+    assert overlay._canvas.texts == ["58/80"]      # 22 HP of margin left
+
+    overlay = make("percent")
+    overlay.render([candidate], (1080, 1920, 3))
+    assert overlay._canvas.texts == ["19%"]
+
+    with pytest.raises(ValueError):
+        DesktopOverlay(
+            {"left": 0, "top": 0, "width": 100, "height": 100}, label_mode="nonsense"
+        )
+
+    parser = build_arg_parser()
+    assert parser.parse_args([]).overlay_label_mode == "hp"
+    assert parser.parse_args(["--overlay_label_mode", "hp_damage"]).overlay_label_mode == "hp_damage"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--overlay_label_mode", "bogus"])

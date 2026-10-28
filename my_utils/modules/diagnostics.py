@@ -40,6 +40,7 @@ class FrameStats:
     locator_matches: int = 0
     eligible: int = 0
     kept: int = 0
+    held: int = 0
     health: list[float] = field(default_factory=list)
     stale: bool = False
     detection_age: float | None = None
@@ -84,6 +85,7 @@ def stats_from_frame(
         locator_matches=int(pipeline.get("fallback_matches", 0)),
         eligible=int(pipeline.get("eligible", 0)),
         kept=int(pipeline.get("kept", 0)),
+        held=int(pipeline.get("held", 0)),
         health=[float(v) for v in pipeline.get("health", []) if isfinite(float(v))],
         stale=bool(pipeline.get("stale", False)),
         detection_age=detection_age_seconds,
@@ -117,7 +119,9 @@ def format_stats(
         f"other-color bodies={stats.other_color_bodies} bars={stats.other_color_bars} | "
         f"matched={stats.matched} (yolo bars={stats.yolo_matches}, "
         f"geo bars={stats.locator_matches}) hp=[{health}] | "
-        f"eligible={stats.eligible} drawn={stats.kept} | "
+        f"eligible={stats.eligible} drawn={stats.kept}"
+        + (f" (held {stats.held})" if stats.held else "")
+        + " | "
         f"infer={_ms(stats.inference_seconds)} box_age={_ms(stats.detection_age)}"
     )
     if timings:

@@ -21,6 +21,11 @@ import numpy as np
 OVERLAY_KEY_COLOR = "#ff00fe"
 PRIMARY_TARGET_COLOR = "#ffff00"     # #1 priority last-hit target (yellow)
 SECONDARY_TARGET_COLOR = "#00c800"   # #2+ last-hittable minions (green)
+HELD_PRIMARY_COLOR = "#b8b800"       # dimmed yellow: marker held, minion not detected
+HELD_SECONDARY_COLOR = "#009a00"     # dimmed green
+LABEL_MODES = ("hp", "hp_damage", "percent")
+LABEL_COLOR = "#ffffff"
+LABEL_OUTLINE = "#000000"
 
 DEFAULT_MARKER_GAP = 16.0            # frame pixels above the bounding box
 MIN_SCALE = 0.2
@@ -93,7 +98,14 @@ class DesktopOverlay:
         topmost: bool = True,
         ignore_input: bool = True,
         max_fps: float = 60.0,
+        show_labels: bool = True,
+        label_font: tuple = ("Segoe UI", 9, "bold"),
+        label_offset: float = 6.0,
+        label_mode: str = "hp",
+        damage: float | None = None,
     ) -> None:
+        if label_mode not in LABEL_MODES:
+            raise ValueError(f"label mode must be one of {', '.join(LABEL_MODES)}")
         try:
             left = int(monitor["left"])
             top = int(monitor["top"])
@@ -118,6 +130,12 @@ class DesktopOverlay:
         self.monitor_width = width
         self.monitor_height = height
         self.marker_gap = float(marker_gap)
+        self.show_labels = bool(show_labels)
+        self.label_font = label_font
+        self.label_offset = float(label_offset)
+        self.label_mode = label_mode
+        # Shown as "hp/damage" so the player sees the remaining margin at a glance.
+        self.damage = None if damage is None else float(damage)
         self._max_interval = 1.0 / max_fps if max_fps and max_fps > 0 else 0.0
         self._last_render = 0.0
         self._closed = False
@@ -215,17 +233,58 @@ class DesktopOverlay:
                 points = tuple((x * scale_x, y * scale_y) for x, y in points)
                 if not all(np.isfinite([coord for point in points for coord in point])):
                     continue
-                color = (
-                    PRIMARY_TARGET_COLOR if priority_rank == 1 else SECONDARY_TARGET_COLOR
-                )
+                held = bool(getattr(candidate, "held", False))
+                if priority_rank == 1:
+                    color = HELD_PRIMARY_COLOR if held else PRIMARY_TARGET_COLOR
+                else:
+                    color = HELD_SECONDARY_COLOR if held else SECONDARY_TARGET_COLOR
                 flat = [coord for point in points for coord in point]
                 self._canvas.create_polygon(
-                    *flat, fill=color, outline="#101010", width=1
+                    *flat,
+                    fill=color,
+                    outline="#101010",
+                    width=1,
+                    # Held markers are dashed so an expired reading is obvious.
+                    dash=(2, 2) if held else (),
                 )
+                if self.show_labels:
+                    label = self._label_for(candidate, priority_rank, held)
+                    if label:
+                        anchor_x = 0.5 * (points[1][0] + points[2][0])
+                        anchor_y = points[1][1] - self.label_offset * self._display_scale
+                        self._canvas.create_text(
+                            anchor_x,
+                            anchor_y,
+                            text=label,
+                            fill=LABEL_COLOR,
+                            font=self.label_font,
+                            anchor="s",
+                            tags=("label",),
+                        )
             self._root.update()
         except Exception:
             # A destroyed/invalid overlay must never take the capture loop down.
             self.close()
+
+    def _label_for(self, candidate, priority_rank: int, held: bool) -> str:
+        """Short text above a marker: estimated HP, with '?' while the reading is held."""
+        try:
+            health = float(getattr(candidate, "health_upper_bound", 0.0))
+        except (TypeError, ValueError):
+            return ""
+        if not isfinite(health) or health <= 0:
+            return ""
+        suffix = "?" if held else ""
+        mode = getattr(self, "label_mode", "hp")
+        if mode == "percent":
+            try:
+                percent = float(getattr(candidate, "health_percent", 0.0))
+            except (TypeError, ValueError):
+                percent = 0.0
+            return f"{percent:.0f}%{suffix}"
+        if mode == "hp_damage" and self.damage is not None:
+            return f"{health:.0f}/{self.damage:.0f}{suffix}"
+        return f"{health:.0f} HP{suffix}"
 
     def close(self) -> None:
         if self._closed:

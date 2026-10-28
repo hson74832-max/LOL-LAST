@@ -82,8 +82,15 @@ class LastHitSettings:
 @dataclass(frozen=True)
 class LastHitCandidate:
     minion: Minion
-    health_upper_bound: float
+    health_upper_bound: float     # absolute HP upper bound (fraction x max HP)
     distance: float
+    # True when the minion is no longer detected and the marker is only held for a
+    # moment (--hold_ms) so a flickering health bar cannot make it blink away.
+    held: bool = False
+
+    @property
+    def health_percent(self) -> float:
+        return 100.0 * float(self.minion.health_level)
 
 
 class LastHitAdvisor:
