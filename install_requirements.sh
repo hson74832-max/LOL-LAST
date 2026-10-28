@@ -5,9 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 USE_SYSTEM=0
+USE_DIRECTML=0
 for arg in "$@"; do
     case "$arg" in
         --system) USE_SYSTEM=1 ;;
+        --directml|--amd) USE_DIRECTML=1 ;;
     esac
 done
 
@@ -53,6 +55,15 @@ echo "[INFO] Upgrading pip, setuptools, and wheel..."
 
 echo "[INFO] Installing Python requirements from requirements.txt..."
 "$TARGET_PYTHON" -m pip install -r requirements.txt
+
+if [[ "$USE_DIRECTML" -eq 1 ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "[INFO] DirectML is Windows-only; macOS already uses the Metal (MPS) backend."
+    elif [[ "$(uname -s)" == "Linux" ]]; then
+        echo "[WARNING] DirectML is Windows-only. For AMD GPUs on Linux install ROCm-enabled PyTorch:" >&2
+        echo "          https://pytorch.org/get-started/locally/   (select ROCm)" >&2
+    fi
+fi
 
 if [[ ! -f "yolov9/models/common.py" ]]; then
     echo "[INFO] Setting up YOLOv9 repository in ./yolov9 ..."

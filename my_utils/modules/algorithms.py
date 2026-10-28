@@ -69,18 +69,26 @@ class ObjectAssociator:
         min_confidence=0.25,
         ambiguity_margin=0.05,
         health_bar_utils=None,
+        bar_min_confidence=0.20,
     ):
         for name, value in (
             ("intersection threshold", intersection_threshold),
             ("minimum confidence", min_confidence),
+            ("bar minimum confidence", bar_min_confidence),
             ("ambiguity margin", ambiguity_margin),
         ):
             if not isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be between 0 and 1")
-        if intersection_threshold == 0 or min_confidence == 0:
-            raise ValueError("intersection threshold and minimum confidence must be positive")
+        if intersection_threshold == 0 or min_confidence == 0 or bar_min_confidence == 0:
+            raise ValueError(
+                "intersection threshold, minimum confidence and bar minimum confidence "
+                "must be positive"
+            )
         self.intersection_threshold = intersection_threshold
         self.min_confidence = min_confidence
+        # Low-HP bars score lower than bodies, so bars get their own (usually lower)
+        # threshold.  Raising it rejects corpse flashes and effect artifacts.
+        self.bar_min_confidence = bar_min_confidence
         self.ambiguity_margin = ambiguity_margin
         self.health_bar_utils = health_bar_utils or HealthBarUtils()
 
@@ -97,8 +105,9 @@ class ObjectAssociator:
 
     def _prepare(self, entries, img_shape, minion_color, is_bar, excluded_regions):
         height, width = img_shape[:2]
-        # Low-HP health bars have very few colored pixels, so YOLOv9 reports lower confidence on them.
-        threshold = min(self.min_confidence, 0.20) if is_bar else self.min_confidence
+        # Low-HP health bars have very few colored pixels, so YOLOv9 reports lower
+        # confidence on them; that is why bars have their own threshold.
+        threshold = self.bar_min_confidence if is_bar else self.min_confidence
         detections = []
         for entry in entries:
             try:

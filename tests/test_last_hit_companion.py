@@ -797,3 +797,410 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
     with pytest.raises(KeyboardInterrupt):
         main_module.main(["--sync", "--no-visualize", "--no-overlay"])
     assert events == []
+
+
+def test_device_selection_covers_cuda_mps_directml_and_cpu(monkeypatch):
+    """AMD/Intel GPUs must be usable through torch-directml instead of silently using CPU."""
+    import types
+
+    from my_utils.modules import detector as detector_module
+    from my_utils.modules.detector import (
+        directml_available,
+        is_directml_request,
+        select_default_device,
+    )
+
+    def fake_torch(cuda=False, mps=False):
+        backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: mps))
+        return types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: cuda), backends=backends
+        )
+
+    monkeypatch.setattr(detector_module, "directml_available", lambda: False)
+    assert select_default_device(fake_torch(cuda=True)) == "cuda:0"
+    assert select_default_device(fake_torch(mps=True)) == "mps"
+    assert select_default_device(fake_torch()) == "cpu"
+
+    # With torch-directml present on an AMD/Intel machine, DirectML wins over CPU.
+    monkeypatch.setattr(detector_module, "directml_available", lambda: True)
+    assert select_default_device(fake_torch()) == "directml"
+    assert select_default_device(fake_torch(cuda=True)) == "cuda:0"
+
+    for alias in ("directml", "DirectML", "dml", "privateuseone:0", " privateuseone "):
+        assert is_directml_request(alias) is True
+    for value in ("cpu", "cuda:0", "mps", None):
+        assert is_directml_request(value) is False
+
+    # Not installed -> availability is False and the error message points at the fix.
+    monkeypatch.undo()
+    monkeypatch.setitem(sys.modules, "torch_directml", None)
+    assert directml_available() is False
+    with pytest.raises(RuntimeError) as excinfo:
+        detector_module.directml_device()
+    assert "torch-directml" in str(excinfo.value)
+
+    # A working fake backend is returned as-is.
+    fake_dml = types.SimpleNamespace(
+        is_available=lambda: True, device=lambda: "dml-device"
+    )
+    monkeypatch.setitem(sys.modules, "torch_directml", fake_dml)
+    assert directml_available() is True
+    assert detector_module.directml_device() == "dml-device"
+
+
+def test_candidate_gate_requires_consecutive_sightings_and_drops_dead_minions():
+    from my_utils.modules.stability import CandidateGate
+
+    with pytest.raises(ValueError):
+        CandidateGate(confirm_frames=0)
+    with pytest.raises(ValueError):
+        CandidateGate(confirm_frames=2, match_ratio=0)
+
+    def candidate(x, y, kind="red caster minion", health=0.1):
+        return LastHitCandidate(
+            minion=Minion(kind, health, (x, y, x + 40, y + 60), 0.9),
+            health_upper_bound=30.0,
+            distance=1.0,
+        )
+
+    gate = CandidateGate(confirm_frames=2)
+    first = candidate(100, 100)
+    second = candidate(400, 100, kind="red melee minion")
+
+    # The live frame is re-evaluated many times per detector result: one result can
+    # never confirm a marker, no matter how many times it is re-read.
+    gen = object()
+    assert gate.update([first, second], (300, 500, 3), generation=gen) == []
+    for _ in range(5):
+        assert gate.update([first, second], (300, 500, 3), generation=gen) == []
+
+    # A new detector result that still sees them confirms both markers.
+    gen = object()
+    confirmed = gate.update([first, second], (300, 500, 3), generation=gen)
+    assert [c.minion.minion_type for c in confirmed] == ["red caster minion", "red melee minion"]
+
+    # Small jitter between frames keeps the same track (no re-confirmation delay).
+    jittered = candidate(104, 103)
+    assert gate.update([jittered], (300, 500, 3), generation=object()) != []
+
+    # Minion dies: it disappears from the very next evaluation, no hold, no memory.
+    assert gate.update([], (300, 500, 3), generation=object()) == []
+    assert gate.track_count == 0
+
+    # After a gap the minion has to be seen twice again (no instant ghost marker).
+    assert gate.update([first], (300, 500, 3), generation=object()) == []
+    assert gate.update([first], (300, 500, 3), generation=object()) != []
+
+    # Adjacent minions in a wave are separate tracks, never merged.
+    gate = CandidateGate(confirm_frames=1)
+    left = candidate(100, 100)
+    right = candidate(175, 100)
+    assert len(gate.update([left, right], (300, 500, 3), generation=object())) == 2
+    assert gate.track_count == 2
+
+    # confirm_frames=1 disables the confirmation delay entirely.
+    gate = CandidateGate(confirm_frames=1)
+    assert gate.update([first], (300, 500, 3), generation=object()) != []
+
+
+def test_stale_detections_are_never_drawn_as_markers():
+    """Boxes older than --max_detection_age must be discarded, not projected on the live frame."""
+    from main import DEFAULT_MAX_DETECTION_AGE, detection_age
+
+    img = np.zeros((300, 400, 3), dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
+
+    detections = {
+        "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+        "red_health_bars": [((100, 90, 160, 98), 0.89)],
+        "blue_minions": [],
+        "blue_health_bars": [],
+        "cur_object_counts": {},
+    }
+    settings = LastHitSettings(
+        effective_damage=77.0, max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0}
+    )
+    associator = ObjectAssociator()
+    advisor = LastHitAdvisor(settings)
+
+    det_frame = CapturedFrame(image=img.copy(), captured_at=1.0)
+    live_frame = CapturedFrame(image=img.copy(), captured_at=1.05)
+    assert detection_age(live_frame, (det_frame, detections)) == pytest.approx(0.05)
+    assert detection_age(live_frame, None) is None
+
+    # Fresh boxes: the minion is a valid last-hit candidate.
+    candidates, _ = evaluate_with_latest_detections(
+        captured_frame=live_frame,
+        latest_detection=(det_frame, detections),
+        object_associator=associator,
+        advisor=advisor,
+    )
+    assert len(candidates) == 1
+
+    # Same boxes, but now far too old (slow inference): nothing is drawn at all.
+    stale_live = CapturedFrame(image=img.copy(), captured_at=1.0 + DEFAULT_MAX_DETECTION_AGE + 0.2)
+    assert detection_age(stale_live, (det_frame, detections)) > DEFAULT_MAX_DETECTION_AGE
+    candidates, _ = evaluate_with_latest_detections(
+        captured_frame=stale_live,
+        latest_detection=(det_frame, detections),
+        object_associator=associator,
+        advisor=advisor,
+    )
+    assert candidates == []
+
+    # The legacy 0.6 s "re-run on the previous frame" fallback is opt-in only.
+    empty_live = CapturedFrame(image=np.zeros((300, 400, 3), dtype=np.uint8), captured_at=1.2)
+    off, _ = evaluate_with_latest_detections(
+        captured_frame=empty_live,
+        latest_detection=(det_frame, detections),
+        object_associator=associator,
+        advisor=advisor,
+    )
+    assert off == []
+    on, _ = evaluate_with_latest_detections(
+        captured_frame=empty_live,
+        latest_detection=(det_frame, detections),
+        object_associator=associator,
+        advisor=advisor,
+        allow_stale_frame_fallback=True,
+    )
+    assert len(on) == 1
+
+
+def test_cli_exposes_strictness_knobs_and_bar_confidence_threshold():
+    from main import DEFAULT_BAR_MIN_CONFIDENCE, DEFAULT_CONFIRM_FRAMES, DEFAULT_MAX_DETECTION_AGE
+
+    parser = build_arg_parser()
+    args = parser.parse_args([])
+    assert args.max_detection_age == DEFAULT_MAX_DETECTION_AGE
+    assert args.confirm_frames == DEFAULT_CONFIRM_FRAMES
+    assert args.min_bar_confidence == DEFAULT_BAR_MIN_CONFIDENCE
+    assert args.stale_frame_fallback is False
+
+    strict = parser.parse_args(
+        ["--max_detection_age", "0.15", "--confirm_frames", "3", "--min_bar_confidence", "0.4"]
+    )
+    assert strict.max_detection_age == 0.15
+    assert strict.confirm_frames == 3
+    assert strict.min_bar_confidence == 0.4
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--max_detection_age", "-1"])
+
+    # Bar detections below the bar threshold are dropped (corpse / effect artifacts).
+    img = np.zeros((300, 400, 3), dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=10, color="red")
+    weak_bar = {
+        "red_minions": [((95, 85, 170, 160), "red caster minion", 0.9)],
+        "red_health_bars": [((100, 90, 160, 98), 0.30)],
+        "blue_minions": [],
+        "blue_health_bars": [],
+    }
+    assert len(ObjectAssociator(bar_min_confidence=0.20)(weak_bar, img=img, minion_type="red")) == 1
+    assert ObjectAssociator(bar_min_confidence=0.40)(weak_bar, img=img, minion_type="red") == []
+    with pytest.raises(ValueError):
+        ObjectAssociator(bar_min_confidence=0)
+    with pytest.raises(ValueError):
+        ObjectAssociator(bar_min_confidence=1.5)
+
+
+def test_main_gates_markers_and_honours_confirm_frames(monkeypatch):
+    """main() must route candidates through the confirmation gate and the bar threshold."""
+    import main as main_module
+
+    img = np.zeros((300, 400, 3), dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, _frame):
+            return {
+                "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+                "red_health_bars": [((100, 90, 160, 98), 0.89)],
+                "blue_minions": [],
+                "blue_health_bars": [],
+                "cur_object_counts": {},
+            }
+
+    remaining = [CapturedFrame(image=img.copy(), captured_at=1.0 + i) for i in range(4)]
+
+    class FakeFrameLoader:
+        monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+        primary_monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def grab(self, window_rect=None):
+            if not remaining:
+                raise KeyboardInterrupt
+            return remaining.pop(0)
+
+    rendered = []
+
+    class FakeOverlay:
+        def __init__(self, monitor, primary_width=None, marker_gap=16.0):
+            self.closed = False
+
+        def render(self, candidates, frame_shape):
+            rendered.append(len(candidates))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "Detector", FakeDetector)
+    monkeypatch.setattr(main_module, "FrameLoader", FakeFrameLoader)
+    monkeypatch.setattr(main_module, "DesktopOverlay", FakeOverlay)
+
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(["--sync", "--no-visualize", "--confirm_frames", "2"])
+    # First inference only seeds the track; from the second one the marker is drawn.
+    assert rendered == [0, 1, 1, 1]
+
+    rendered.clear()
+    remaining.extend(CapturedFrame(image=img.copy(), captured_at=5.0 + i) for i in range(3))
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(["--sync", "--no-visualize", "--confirm_frames", "1"])
+    assert rendered == [1, 1, 1]
+
+
+def test_directml_detector_builds_on_cpu_and_moves_model_to_dml(monkeypatch, tmp_path, capsys):
+    """AMD/Intel path: YOLOv9 cannot build on 'privateuseone', so build on CPU then move."""
+    import types as _types
+
+    from my_utils.modules import detector as detector_module
+
+    calls = []
+
+    class FakeTensor:
+        def __init__(self, array):
+            self.array = np.asarray(array)
+            self.ndim = self.array.ndim
+            self.shape = self.array.shape
+
+        def to(self, device, non_blocking=False):
+            calls.append(("tensor.to", str(device)))
+            return self
+
+        def half(self):
+            return self
+
+        def float(self):
+            return self
+
+        def __itruediv__(self, value):
+            self.array = self.array / value
+            return self
+
+        def __getitem__(self, item):
+            return FakeTensor(self.array[item])
+
+    class FakeNet:
+        def __init__(self):
+            self.moved_to = None
+
+        def to(self, device):
+            self.moved_to = str(device)
+            calls.append(("net.to", str(device)))
+            return self
+
+    class FakeModel:
+        names = {0: "red_caster_minion", 1: "red_health_bar"}
+        stride = 32
+        pt = True
+        fp16 = False
+
+        def __init__(self):
+            self.device = "cpu"
+            self.model = FakeNet()
+
+        def __call__(self, tensor, augment=False, visualize=False):
+            calls.append(("forward", str(self.device)))
+
+            class Pred:
+                def cpu(self):
+                    calls.append(("pred.cpu",))
+                    return np.array([[10.0, 20.0, 50.0, 60.0, 0.9, 0.0]])
+
+            return Pred()
+
+    class FakeDevice:
+        def __init__(self, name):
+            self.name = str(name)
+            self.type = self.name.split(":")[0]
+
+        def __str__(self):
+            return self.name
+
+    fake_torch = _types.SimpleNamespace(
+        device=FakeDevice,
+        load=lambda *a, **k: {},
+        no_grad=lambda: __import__("contextlib").nullcontext(),
+        from_numpy=lambda array: FakeTensor(array),
+        backends=_types.SimpleNamespace(cudnn=_types.SimpleNamespace(benchmark=False)),
+    )
+    fake_dml = _types.SimpleNamespace(
+        is_available=lambda: True, device=lambda: "dml-device"
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch_directml", fake_dml)
+    monkeypatch.setattr(detector_module, "resolve_weight_path", lambda *a, **k: tmp_path / "best.pt")
+    monkeypatch.setattr(
+        detector_module,
+        "_load_yolov9_symbols",
+        lambda: (
+            lambda *a, **k: FakeModel(),
+            lambda img, size, stride=32, auto=True: (img, None, None),
+            lambda pred, **kwargs: [pred],
+            lambda *a, **k: a[1],
+        ),
+    )
+
+    detector = Detector(weight_path=tmp_path / "best.pt", device="directml", half=True)
+    assert detector.directml is True
+    assert detector.device_name == "dml-device"
+    assert ("net.to", "dml-device") in calls
+    out = capsys.readouterr().out
+    assert "DirectML" in out
+    assert "fp16 is not supported by DirectML" in out
+
+    # Inference: input goes to the DML device, predictions come back to CPU for NMS.
+    result = detector(np.zeros((64, 64, 3), dtype=np.uint8))
+    assert ("tensor.to", "dml-device") in calls
+    assert ("forward", "dml-device") in calls
+    assert ("pred.cpu",) in calls
+    assert len(result["red_minions"]) == 1
+
+    # A DirectML failure must degrade to CPU instead of crashing.
+    calls.clear()
+
+    class BrokenNet(FakeNet):
+        def to(self, device):
+            raise RuntimeError("dml init failed")
+
+    class BrokenModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.model = BrokenNet()
+
+    monkeypatch.setattr(
+        detector_module,
+        "_load_yolov9_symbols",
+        lambda: (
+            lambda *a, **k: BrokenModel(),
+            lambda img, size, stride=32, auto=True: (img, None, None),
+            lambda pred, **kwargs: [pred],
+            lambda *a, **k: a[1],
+        ),
+    )
+    detector = Detector(weight_path=tmp_path / "best.pt", device="dml")
+    assert detector.directml is False
+    assert detector.device_name == "cpu"
+    assert "falling back to CPU" in capsys.readouterr().out
