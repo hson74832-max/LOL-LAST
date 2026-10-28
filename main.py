@@ -291,6 +291,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--bar_locator",
+        nargs="?",
+        const=True,
+        default=True,
+        type=_parse_bool,
+        help=(
+            "Read a health bar geometrically around each detected minion body when YOLOv9 "
+            "reports no bar for it (default True). Disable with --no-bar_locator to require "
+            "a detected bar class."
+        ),
+    )
+    parser.add_argument(
+        "--no-bar_locator",
+        dest="bar_locator",
+        action="store_false",
+        help="Require YOLOv9 health-bar detections; do not read bars from the pixels.",
+    )
+    parser.add_argument(
         "--stale_frame_fallback",
         action="store_true",
         help=(
@@ -401,6 +419,7 @@ def process_frame(
             eligible=len(candidates),
             health=[m.health_level for m in matched_minions],
             detection_result=detection_result,
+            **getattr(object_associator, "last_stats", {}),
         )
     if gate is not None:
         candidates = gate.update(
@@ -495,6 +514,7 @@ def evaluate_with_latest_detections(
             health=[m.health_level for m in matched_minions],
             stale=False,
             detection_result=detection_result,
+            **getattr(object_associator, "last_stats", {}),
         )
     if gate is not None:
         # Sightings are counted per detector result, not per capture frame.
@@ -582,13 +602,15 @@ def main(argv: list[str] | None = None) -> int:
     object_associator = ObjectAssociator(
         min_confidence=args.min_confidence,
         bar_min_confidence=args.min_bar_confidence,
+        fallback_to_locator=args.bar_locator,
     )
     advisor = LastHitAdvisor(settings)
     gate = CandidateGate(confirm_frames=args.confirm_frames)
     print(
         f"[INFO] Markers require {args.confirm_frames} consecutive frame(s); detector boxes "
         f"older than {args.max_detection_age * 1000:.0f} ms are ignored; "
-        f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}."
+        f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}; "
+        f"geometric health-bar reading {'on' if args.bar_locator else 'off'}."
     )
     annotator = AIAnnotator() if args.visualize else None
     reporter = (

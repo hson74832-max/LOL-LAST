@@ -996,7 +996,17 @@ def test_cli_exposes_strictness_knobs_and_bar_confidence_threshold():
         "blue_health_bars": [],
     }
     assert len(ObjectAssociator(bar_min_confidence=0.20)(weak_bar, img=img, minion_type="red")) == 1
-    assert ObjectAssociator(bar_min_confidence=0.40)(weak_bar, img=img, minion_type="red") == []
+    # Raising the bar threshold rejects the YOLO bar detection itself ...
+    assert (
+        ObjectAssociator(bar_min_confidence=0.40, fallback_to_locator=False)(
+            weak_bar, img=img, minion_type="red"
+        )
+        == []
+    )
+    # ... but the geometric locator can still read the bar from the pixels.
+    fallback = ObjectAssociator(bar_min_confidence=0.40)(weak_bar, img=img, minion_type="red")
+    assert len(fallback) == 1
+    assert 0.1 < fallback[0].health_level < 0.3
     with pytest.raises(ValueError):
         ObjectAssociator(bar_min_confidence=0)
     with pytest.raises(ValueError):
@@ -1377,10 +1387,12 @@ def test_debug_stats_and_hints_explain_every_empty_pipeline_stage():
     assert "no minions and no health bars" in hint({"red_minions": [], "red_health_bars": []})
     # Wrong minion colour
     assert "--minion_color blue" in hint({"red_minions": [], "blue_minions": [1, 2]})
-    # Bodies without bars
-    assert "--min_bar_confidence" in hint({"red_minions": [1, 2, 3], "red_health_bars": []})
-    # No association
-    assert "none were matched" in hint(
+    # Bodies without any readable bar (YOLO and locator both failed)
+    unreadable = hint({"red_minions": [1, 2, 3], "red_health_bars": []})
+    assert "--min_bar_confidence" in unreadable and "--imgsz 960" in unreadable
+    assert "3 minion bodies detected" in unreadable
+    # Bodies with a YOLO bar that still could not be read
+    assert "1 YOLOv9 bar" in hint(
         {"red_minions": [1, 2], "red_health_bars": [1]}, {"matched": 0}
     )
     # Health filter rejects everything
@@ -1538,3 +1550,169 @@ def test_describe_thresholds_turns_damage_into_hp_percentages():
 
     huge = LastHitSettings(effective_damage=900.0, max_health={"caster": 300.0})
     assert "any HP" in "\n".join(describe_thresholds(huge))
+
+
+def make_wave_bar(width=30, height=5, fill=8):
+    """A League-like bar: saturated fill, dark depleted part, 1px border."""
+    bar = np.zeros((height, width, 3), dtype=np.uint8)
+    bar[:, :fill] = [55, 55, 185]
+    bar[:, fill:] = [28, 22, 32]
+    bar[0, :] = [15, 15, 15]
+    bar[-1, :] = [15, 15, 15]
+    bar[:, 0] = [15, 15, 15]
+    bar[:, -1] = [15, 15, 15]
+    return cv2.GaussianBlur(bar, (3, 1), 0.6)
+
+
+def test_health_bar_locator_reads_bars_from_pixels_around_bodies():
+    from my_utils.modules.bar_locator import HealthBarLocator
+
+    locator = HealthBarLocator()
+    for background in ([45, 45, 45], [40, 90, 60], [120, 120, 118], [170, 170, 170]):
+        img = np.zeros((400, 600, 3), dtype=np.uint8)
+        img[:] = background
+        truth = []
+        for i in range(4):
+            x = 80 + i * 120
+            fill = 4 + i * 6
+            img[264:269, x : x + 30] = make_wave_bar(fill=fill)
+            truth.append((x, fill / 30.0))
+
+        for x, expected in truth:
+            body = (x - 5, 280, x + 35, 340)
+            reading = locator.locate(img, body, bar_color="red")
+            assert reading is not None, f"no bar found on background {background}"
+            # Accurate and slightly conservative (never an under-estimate of remaining HP).
+            assert reading.level >= expected - 0.02
+            assert reading.level <= expected + 0.06
+            assert reading.box[0] == pytest.approx(x, abs=2)
+
+    # Empty terrain -> no bar, no false positive.
+    empty = np.full((400, 600, 3), 70, dtype=np.uint8)
+    assert locator.locate(empty, (100, 100, 140, 160), "red") is None
+    # A body that is far too small to own a bar is rejected.
+    assert locator.locate(np.full((50, 50, 3), 45, dtype=np.uint8), (10, 10, 12, 12), "red") is None
+    with pytest.raises(ValueError):
+        locator.locate(np.zeros((10, 10), dtype=np.uint8), (1, 1, 5, 5), "red")
+    with pytest.raises(ValueError):
+        HealthBarLocator(min_span_ratio=2.0, max_span_ratio=1.0)
+
+
+def test_blue_bars_are_found_too():
+    from my_utils.modules.bar_locator import HealthBarLocator
+
+    img = np.full((300, 400, 3), 50, dtype=np.uint8)
+    bar = np.zeros((5, 30, 3), dtype=np.uint8)
+    bar[:, :12] = [200, 150, 40]      # blue team fill (BGR)
+    bar[:, 12:] = [25, 20, 30]
+    bar[0, :] = [15, 15, 15]
+    bar[-1, :] = [15, 15, 15]
+    bar[:, 0] = [15, 15, 15]
+    bar[:, -1] = [15, 15, 15]
+    img[280:285, 100:130] = bar
+
+    reading = HealthBarLocator().locate(img, (96, 296, 136, 356), bar_color="blue")
+    assert reading is not None
+    assert 0.3 < reading.level < 0.55
+    # A red request on a blue bar finds nothing.
+    assert HealthBarLocator().locate(img, (96, 296, 136, 356), bar_color="red") is None
+
+
+def test_wave_without_yolo_bars_still_produces_last_hit_candidates():
+    """Regression for the reported case: 8-9 bodies, 0-2 YOLO bars -> no markers at all."""
+    img = np.full((720, 1280, 3), 45, dtype=np.uint8)
+    bodies = []
+    expected_levels = []
+    for i in range(8):
+        x = 120 + i * 130
+        y = 320 + (i % 2) * 70
+        fill = 3 + i * 3
+        img[y - 16 : y - 11, x : x + 30] = make_wave_bar(fill=fill)
+        bodies.append(((x - 4, y, x + 36, y + 60), "red caster minion", 0.88))
+        expected_levels.append(fill / 30.0)
+
+    detection_result = {
+        "red_minions": bodies,
+        "red_health_bars": [],          # YOLOv9 found no bars: this is the bug scenario
+        "blue_minions": [],
+        "blue_health_bars": [],
+    }
+
+    associator = ObjectAssociator()
+    matched = associator(detection_result, img=img, minion_type="red")
+    assert len(matched) == 8
+    assert associator.last_stats == {"yolo_matches": 0, "fallback_matches": 8}
+    for minion, expected in zip(matched, expected_levels):
+        assert minion.health_level == pytest.approx(expected, abs=0.06)
+        assert minion.minion_type == "red caster minion"
+
+    # The lowest-HP minions are now last-hittable and reach the advisor...
+    settings = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+    )
+    ranked = LastHitAdvisor(settings).rank(matched, img.shape)
+    assert ranked, "geometric bar reading must make low-HP minions actionable"
+    assert all(c.health_upper_bound <= 80.0 for c in ranked)
+
+    # ... and --no-bar_locator restores the old (broken) behaviour.
+    legacy = ObjectAssociator(fallback_to_locator=False)
+    assert legacy(detection_result, img=img, minion_type="red") == []
+
+
+def test_cli_exposes_bar_locator_switch():
+    parser = build_arg_parser()
+    assert parser.parse_args([]).bar_locator is True
+    assert parser.parse_args(["--no-bar_locator"]).bar_locator is False
+    assert parser.parse_args(["--bar_locator", "False"]).bar_locator is False
+
+
+def test_process_frame_reports_geometric_bars_in_debug_stats(capsys):
+    """End-to-end regression of the reported session: 9 bodies, no YOLO bars, no markers."""
+    from main import process_frame
+    from my_utils.modules.diagnostics import DebugReporter, format_stats, stats_from_frame
+
+    img = np.full((720, 1280, 3), 53, dtype=np.uint8)
+    bodies = []
+    for i in range(9):
+        x = 110 + i * 120
+        y = 330 + (i % 2) * 60
+        img[y - 16 : y - 11, x : x + 30] = make_wave_bar(fill=3 + i * 3)
+        bodies.append(((x - 4, y, x + 36, y + 60), "red caster minion", 0.85))
+
+    class WaveDetector:
+        def __call__(self, _frame):
+            return {
+                "red_minions": bodies,
+                "red_health_bars": [],       # <- the reported situation
+                "blue_minions": [],
+                "blue_health_bars": [],
+            }
+
+    settings = LastHitSettings(
+        effective_damage=80.0,
+        max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+    )
+    pipeline_stats = {}
+    candidates, visualized = process_frame(
+        captured_frame=CapturedFrame(image=img, captured_at=1.0),
+        detector=WaveDetector(),  # type: ignore[arg-type]
+        object_associator=ObjectAssociator(),
+        advisor=LastHitAdvisor(settings),
+        annotator=AIAnnotator(),
+        minion_color="red",
+        pipeline_stats=pipeline_stats,
+    )
+
+    assert pipeline_stats["matched"] == 9
+    assert pipeline_stats["yolo_matches"] == 0
+    assert pipeline_stats["fallback_matches"] == 9
+    assert candidates, "low-HP minions must be marked even without YOLO bar detections"
+    assert visualized is not None
+
+    stats = stats_from_frame(img, {"red_minions": bodies, "red_health_bars": []},
+                             "red", pipeline=pipeline_stats)
+    assert "geo bars=9" in format_stats(stats, "red")
+    reporter = DebugReporter(minion_color="red", interval=0.0)
+    assert reporter.report(stats, force=True) is None  # markers exist -> no hint
+    assert "geo bars=9" in capsys.readouterr().out

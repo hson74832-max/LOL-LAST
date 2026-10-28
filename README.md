@@ -70,6 +70,16 @@ Check the first lines of console output, they state the device explicitly, e.g.:
 [INFO] Detector initialized on device=privateuseone:0 [DirectML] (fp16=False, imgsz=(640, 640))
 ```
 
+## Missing health bars no longer hide minions
+YOLOv9's `*_health_bar` class is the weakest link in a real fight: reports of 8–9 detected minion bodies with 0–2 detected bars are common, and without a bar a minion can never be associated, so **no marker can be drawn at all**.
+
+The associator therefore reads the bar **geometrically** from the captured pixels around each detected body: it looks for the League bar signature (saturated fill on the left, dark depleted part, ~1 px border) in a window above/around the body, requires a plausible width relative to the body and consistent rows, and uses the rightmost filled column as a conservative HP upper bound — exactly like the template-based reader.
+
+- Every reported reading is still an upper bound, so the "only last-hittable" guarantee is unchanged.
+- Bodies whose YOLO bar was rejected as clipped/ambiguous stay rejected; the locator only fills in bodies that had **no** bar.
+- Seen in `--debug`: `matched=8 (yolo bars=2, geo bars=6)`.
+- Disable with `--no-bar_locator` to require YOLOv9 bar detections only.
+
 ## "No markers at all" — start with `--debug`
 If nothing is drawn (neither on the game nor in the preview), run with diagnostics; every second it prints what each pipeline stage saw and *why* nothing was shown:
 
@@ -177,6 +187,7 @@ python main.py --list-monitors
 - `--min_bar_confidence`: Minimum detection confidence for health bars (default `0.20`).
 - `--max_detection_age`: Maximum age in seconds of detector boxes reused on a live frame (default `0.35`, `0` disables).
 - `--confirm_frames`: Consecutive detector results a candidate must be seen in before it is drawn (default `2`).
+- `--bar_locator` / `--no-bar_locator`: Read health bars geometrically around each body when YOLOv9 reports none (default on).
 - `--stale_frame_fallback`: Re-enable the legacy previous-frame fallback (off by default).
 - `--debug` / `--no-debug`: Per-frame diagnostics plus a one-line explanation of why no marker is drawn; writes `frames/debug/latest.png`.
 - `--debug_frames_dir`, `--debug_interval`: Where/how often the diagnostics write frames and lines.
