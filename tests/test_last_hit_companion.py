@@ -783,8 +783,8 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
             self.closed = False
             events.append(("init", monitor["width"], primary_width, marker_gap))
 
-        def render(self, candidates, frame_shape):
-            events.append(("render", len(candidates), tuple(frame_shape[:2])))
+        def render(self, candidates, frame_shape, labels=None):
+            events.append(("render", len(candidates), tuple(frame_shape[:2]), len(labels or [])))
 
         def close(self):
             events.append(("close",))
@@ -797,7 +797,7 @@ def test_main_loop_draws_candidates_on_the_desktop_overlay(monkeypatch, capsys):
         main_module.main(["--sync", "--no-visualize", "--overlay_gap", "20"])
 
     assert events[0] == ("init", 400, 400, 20.0)
-    assert ("render", 1, (300, 400)) in events
+    assert ("render", 1, (300, 400), 1) in events
     assert events[-1] == ("close",)
 
     # --no-overlay keeps the desktop clean.
@@ -1071,7 +1071,7 @@ def test_main_gates_markers_and_honours_confirm_frames(monkeypatch):
             assert label_mode in {"hp", "hp_damage", "percent"}
             assert damage is None or damage > 0
 
-        def render(self, candidates, frame_shape):
+        def render(self, candidates, frame_shape, labels=None):
             rendered.append(len(candidates))
 
         def close(self):
@@ -2236,3 +2236,372 @@ def test_overlay_label_modes_show_hp_damage_margin():
     assert parser.parse_args(["--overlay_label_mode", "hp_damage"]).overlay_label_mode == "hp_damage"
     with pytest.raises(SystemExit):
         parser.parse_args(["--overlay_label_mode", "bogus"])
+
+
+def _hp_minion(hp, kind="red caster minion", x=100, y=200, confidence=0.9):
+    return Minion(kind, hp, (x, y, x + 40, y + 60), confidence)
+
+
+def test_hp_labels_start_at_the_threshold_and_stay_until_the_minion_dies():
+    """The number appears before the minion is killable and survives bar flicker."""
+    from my_utils.modules.hp_labels import HpLabelTracker
+
+    max_hp = {"caster": 300.0, "melee": 500.0, "siege": 1500.0}
+    with pytest.raises(ValueError):
+        HpLabelTracker(max_health={})
+    with pytest.raises(ValueError):
+        HpLabelTracker(max_health={"purple": 100.0})
+    with pytest.raises(ValueError):
+        HpLabelTracker(max_health=max_hp, threshold_percent=0)
+    with pytest.raises(ValueError):
+        HpLabelTracker(max_health=max_hp, threshold_percent=101)
+    with pytest.raises(ValueError):
+        HpLabelTracker(max_health=max_hp, hold_ms=-1)
+
+    tracker = HpLabelTracker(max_health=max_hp, threshold_percent=50.0, hold_ms=1000.0)
+
+    # A healthy minion shows no number: the overlay stays readable.
+    assert tracker.update([_hp_minion(0.60)], now=0.0) == []
+
+    # Below the threshold the number appears immediately - long before the minion
+    # is last-hittable - and it is a conservative (upper-bound) HP value.
+    labels = tracker.update([_hp_minion(0.45)], now=0.1)
+    assert len(labels) == 1
+    assert labels[0].health_upper_bound == pytest.approx(135.0)
+    assert labels[0].health_percent == pytest.approx(45.0)
+    assert labels[0].held is False
+
+    # One flickering bar reading above the threshold must not hide the number.
+    labels = tracker.update([_hp_minion(0.55)], now=0.2)
+    assert len(labels) == 1 and labels[0].held is False
+
+    # Minion stops being detected: the number is held and flagged as stale.
+    held = tracker.update([], now=0.6)
+    assert len(held) == 1 and held[0].held is True
+    assert held[0].health_upper_bound == pytest.approx(165.0)
+
+    # ... and disappears after the grace period, i.e. when the minion is dead.
+    assert tracker.update([], now=2.0) == []
+    assert tracker.track_count == 0
+
+
+def test_hp_labels_ignore_unusable_readings_and_neighbouring_minions_stay_separate():
+    from my_utils.modules.hp_labels import HpLabelTracker
+
+    tracker = HpLabelTracker(max_health={"caster": 300.0, "melee": 500.0}, threshold_percent=50.0)
+    assert tracker.update([Minion("purple caster minion", 0.3, (0, 0, 40, 60), 0.9)]) == []
+    assert tracker.update([Minion("red siege minion", 0.3, (0, 0, 40, 60), 0.9)]) == []
+    assert tracker.update([_hp_minion(0.3, confidence=0.05)]) == []
+    assert tracker.update([Minion("red caster minion", 0.0, (0, 0, 40, 60), 0.9)]) == []
+
+    left = _hp_minion(0.30, x=100, y=200)
+    right = _hp_minion(0.20, x=160, y=200)   # overlapping wave, 60 px away
+    labels = tracker.update([left, right], now=0.0)
+    assert len(labels) == 2
+    assert labels[0].health_upper_bound == pytest.approx(90.0)
+    assert labels[1].health_upper_bound == pytest.approx(60.0)
+
+
+def test_overlay_draws_one_number_per_minion_and_never_duplicates_targets():
+    from my_utils.modules.hp_labels import HpLabel
+    from my_utils.visualizers.overlay import DesktopOverlay
+
+    class _Canvas:
+        def __init__(self):
+            self.texts = []
+            self.polygons = []
+
+        def delete(self, *_a):
+            self.texts.clear()
+            self.polygons.clear()
+
+        def create_polygon(self, *a, **k):
+            self.polygons.append(k)
+
+        def create_text(self, *a, **k):
+            self.texts.append(k["text"])
+
+    overlay = DesktopOverlay.__new__(DesktopOverlay)
+    overlay.monitor_left = overlay.monitor_top = 0
+    overlay.monitor_width, overlay.monitor_height = 1920, 1080
+    overlay.marker_gap = 16.0
+    overlay.show_labels = True
+    overlay.label_font = ("Segoe UI", 9, "bold")
+    overlay.label_offset = 6.0
+    overlay.label_mode = "hp"
+    overlay.damage = None
+    overlay._display_scale = 1.0
+    overlay._max_interval = 0.0
+    overlay._last_render = 0.0
+    overlay._closed = False
+    overlay._tkinter = None
+    overlay._root = type("R", (), {"update": lambda self: None})()
+    overlay._canvas = _Canvas()
+
+    target = _candidate(960, 500, hp=58, health=0.193)
+    same_minion = HpLabel(minion=target.minion, health_upper_bound=58.0)
+    other = HpLabel(
+        minion=Minion("red melee minion", 0.40, (480, 500, 520, 560), 0.9),
+        health_upper_bound=200.0,
+    )
+
+    overlay.render([target], (1080, 1920, 3), labels=[same_minion, other])
+    # The target's own marker label, plus the unrelated minion's number - never twice.
+    assert overlay._canvas.texts == ["58 HP", "200 HP"]
+    assert len(overlay._canvas.polygons) == 1
+
+    # Held numbers are marked with '?' so a stale reading is obvious.
+    overlay.render([], (1080, 1920, 3), labels=[HpLabel(other.minion, 200.0, held=True)])
+    assert overlay._canvas.texts == ["200 HP?"]
+
+    # --no-overlay_labels silences the whole label layer.
+    overlay.show_labels = False
+    overlay.render([target], (1080, 1920, 3), labels=[other])
+    assert overlay._canvas.texts == []
+
+
+def test_annotator_draws_hp_numbers_for_minions_that_are_not_targets():
+    from my_utils.modules.hp_labels import HpLabel
+
+    img = np.zeros((400, 400, 3), dtype=np.uint8)
+    annotator = AIAnnotator()
+    label = HpLabel(
+        minion=Minion("red caster minion", 0.20, (170, 175, 235, 240), 0.9),
+        health_upper_bound=60.0,
+    )
+    rendered = annotator(candidates=[], img=img, labels=[label])
+    assert rendered.sum() > 0, "the number must be visible in the preview window"
+    assert annotator(candidates=[], img=img, labels=[]).sum() == 0
+
+
+def test_process_frame_labels_minions_that_are_not_last_hittable_yet():
+    """A half-dead minion too tanky to kill still gets its number above its head."""
+    from my_utils.modules.hp_labels import HpLabelTracker
+
+    img = np.zeros((400, 400, 3), dtype=np.uint8)
+    img[180:188, 170:230] = make_synthetic_health_bar(width=60, height=8, fill_px=18, color="red")
+
+    class DummyDetector:
+        def __call__(self, _frame):
+            return {
+                "red_minions": [((165, 175, 235, 240), "red caster minion", 0.95)],
+                "red_health_bars": [((170, 180, 230, 188), 0.95)],
+                "blue_minions": [],
+                "blue_health_bars": [],
+            }
+
+    settings = LastHitSettings(
+        effective_damage=20.0,       # far below the minion's HP: nothing is killable
+        max_health={"caster": 300.0, "melee": 500.0, "siege": 1500.0},
+    )
+    tracker = HpLabelTracker(max_health=settings.max_health, threshold_percent=50.0)
+    pipeline_stats = {}
+    candidates, visualized = process_frame(
+        captured_frame=CapturedFrame(image=img, captured_at=1.0),
+        detector=DummyDetector(),  # type: ignore[arg-type]
+        object_associator=ObjectAssociator(),
+        advisor=LastHitAdvisor(settings),
+        annotator=AIAnnotator(),
+        minion_color="red",
+        pipeline_stats=pipeline_stats,
+        hp_tracker=tracker,
+    )
+
+    assert candidates == [], "the minion is not last-hittable with 20 damage"
+    assert pipeline_stats["hp_labels"] == 1
+    assert len(tracker.last_labels) == 1
+    assert tracker.last_labels[0].health_percent <= 50.0
+    assert visualized is not None and visualized.sum() > 0
+
+
+def test_hp_label_cli_flags():
+    parser = build_arg_parser()
+    defaults = parser.parse_args([])
+    assert defaults.hp_labels is True
+    assert defaults.hp_label_below == pytest.approx(50.0)
+    assert defaults.hp_hold_ms > 0
+    assert parser.parse_args(["--no-hp_labels"]).hp_labels is False
+    assert parser.parse_args(["--hp_labels", "False"]).hp_labels is False
+    assert parser.parse_args(["--hp_label_below", "70"]).hp_label_below == 70.0
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--hp_label_below", "0"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--hp_hold_ms", "-5"])
+
+
+def test_damage_table_level_scaling_and_minion_mitigation():
+    from my_utils.modules import damage_table as dt
+
+    assert dt.level_growth(1) == 0.0
+    assert dt.level_growth(2) == pytest.approx(0.72)
+    assert dt.level_growth(3) == pytest.approx(1.475)
+    with pytest.raises(ValueError):
+        dt.level_growth(0)
+    with pytest.raises(ValueError):
+        dt.level_growth(19)
+
+    assert dt.mitigation(0) == pytest.approx(1.0)
+    assert dt.mitigation(-10) == pytest.approx(1.0)     # never amplifies damage
+    assert dt.mitigation(100) == pytest.approx(0.5)
+    assert dt.mitigation(30) == pytest.approx(100.0 / 130.0)
+
+    assert dt.ITEMS["doran_blade"].attack_damage == 8.0
+    assert dt.ITEMS["long_sword"].attack_damage == 10.0
+    assert dt.ITEMS["doran_ring"].ability_power == 15.0
+    assert dt.ITEMS["amplifying_tome"].ability_power == 20.0
+    assert dt.resolve_item("Doran's Ring").key == "doran_ring"
+    assert dt.resolve_item("dorans blade").key == "doran_blade"
+    assert dt.resolve_item(None).key == "none"
+    with pytest.raises(ValueError):
+        dt.resolve_item("Infinity Edge")
+
+
+def test_damage_estimate_uses_champion_stats_items_and_armour():
+    from my_utils.modules import damage_table as dt
+
+    table = dt.champion_table()
+    assert len(table) >= 150, "the committed champion table must cover the roster"
+    assert dt.data_patch()
+
+    stats = dt.resolve_champion("aatrox")
+    assert stats.name == "Aatrox"
+    assert stats.attack_damage_at(1) == pytest.approx(stats.attack_damage)
+    assert stats.attack_damage_at(2) == pytest.approx(
+        stats.attack_damage + stats.attack_damage_per_level * 0.72
+    )
+    assert stats.attack_damage_at(3) == pytest.approx(
+        stats.attack_damage + stats.attack_damage_per_level * 1.475
+    )
+    assert stats.ability_power_at(1) == 0.0     # no champion has base AP
+
+    # Case/punctuation-insensitive lookup, with aliases for awkward names.
+    assert dt.resolve_champion("AATROX").name == "Aatrox"
+    assert dt.resolve_champion("mundo").name == dt.resolve_champion("Dr. Mundo").name
+    with pytest.raises(ValueError):
+        dt.resolve_champion("NotARealChampion")
+
+    estimate = dt.estimate_damage("Aatrox", level=1, item="doran_blade")
+    assert estimate.attack_damage == pytest.approx(stats.attack_damage + 8.0)
+    assert estimate.basic_attack_damage == pytest.approx(stats.attack_damage + 8.0)
+    assert estimate.ability_power == 0.0
+    assert estimate.effective_damage == pytest.approx(estimate.basic_attack_damage)
+    assert estimate.hits_to_kill == 5   # 300 HP caster minion / 68 damage
+
+    armoured = dt.estimate_damage("Aatrox", level=1, item="doran_blade", minion_armor=30)
+    assert armoured.basic_attack_damage == pytest.approx((stats.attack_damage + 8.0) * 100 / 130)
+    assert armoured.effective_damage < estimate.effective_damage
+
+    # AP never adds to a basic attack; it only matters for the (opt-in) ability hit.
+    ap_estimate = dt.estimate_damage("Ahri", level=1, item="doran_ring")
+    assert ap_estimate.ability_power == pytest.approx(15.0)
+    assert ap_estimate.basic_attack_damage == pytest.approx(
+        dt.resolve_champion("Ahri").attack_damage
+    )
+    assert ap_estimate.ability_damage is None
+
+    spell = dt.estimate_damage("Ahri", level=1, item="doran_ring", ap_ratio=0.6, ability_base=80)
+    assert spell.ability_damage == pytest.approx(80 + 0.6 * 15)
+    # The damage value handed to the companion stays a conservative per-hit number.
+    assert spell.effective_damage == pytest.approx(
+        min(spell.basic_attack_damage, spell.ability_damage)
+    )
+
+    with pytest.raises(ValueError):
+        dt.estimate_damage("Ahri", level=0)
+    with pytest.raises(ValueError):
+        dt.estimate_damage("Ahri", ap_ratio=-1)
+
+
+def test_damage_table_rendering_and_cli():
+    from my_utils.modules import damage_table as dt
+
+    text = dt.format_table(["Ahri", "Aatrox"], item="doran_blade")
+    assert "Champion" in text and "Base AD 1/2/3" in text
+    assert "Ahri" in text and "Aatrox" in text
+    assert "Doran's Blade" in text and "Hits vs 300 HP" in text
+    assert dt.data_patch() in text
+
+    ap_text = dt.format_table(["Ahri"], item="doran_ring", ap_ratio=0.6, ability_base=80)
+    assert "AP" in ap_text and "Ability" in ap_text
+
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        ["--champion", "Ahri", "--level", "2", "--item", "doran_ring", "--minion_armor", "30"]
+    )
+    assert args.champion == "Ahri" and args.level == 2
+    assert args.item == "doran_ring" and args.minion_armor == 30.0
+    assert parser.parse_args([]).effective_damage is None, (
+        "--effective_damage must stay unset so --champion can supply it"
+    )
+
+    import main as main_module
+
+    assert main_module.main(["--damage_table", "Ahri", "Aatrox"]) == 0
+    assert main_module.main(["--damage_table"]) == 0     # whole roster
+    with pytest.raises(SystemExit):
+        main_module.main(["--damage_table", "NotARealChampion"])
+
+
+def test_main_derives_effective_damage_from_champion_and_keeps_explicit_override(
+    monkeypatch, capsys
+):
+    import main as main_module
+    from my_utils.modules import damage_table as dt
+
+    img = np.zeros((300, 400, 3), dtype=np.uint8)
+    img[90:98, 100:160] = make_synthetic_health_bar(width=60, height=8, fill_px=8, color="red")
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, _frame):
+            return {
+                "red_minions": [((95, 85, 170, 160), "red caster minion", 0.91)],
+                "red_health_bars": [((100, 90, 160, 98), 0.89)],
+                "blue_minions": [],
+                "blue_health_bars": [],
+            }
+
+    remaining = [CapturedFrame(image=img.copy(), captured_at=1.0) for _ in range(2)]
+
+    class FakeFrameLoader:
+        monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+        primary_monitor = {"left": 0, "top": 0, "width": 400, "height": 300}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def grab(self, window_rect=None):
+            if not remaining:
+                raise KeyboardInterrupt
+            return remaining.pop(0)
+
+    monkeypatch.setattr(main_module, "Detector", FakeDetector)
+    monkeypatch.setattr(main_module, "FrameLoader", FakeFrameLoader)
+
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(
+            ["--sync", "--no-visualize", "--no-overlay", "--champion", "Ahri",
+             "--level", "2", "--item", "doran_ring"]
+        )
+    out = capsys.readouterr().out
+    expected = dt.estimate_damage("Ahri", level=2, item="doran_ring").effective_damage
+    assert "Damage estimate" in out
+    assert f"--effective_damage {expected:.1f}" in out
+
+    # An explicit --effective_damage always wins over the estimate.
+    remaining.extend(CapturedFrame(image=img.copy(), captured_at=1.0) for _ in range(2))
+    with pytest.raises(KeyboardInterrupt):
+        main_module.main(
+            ["--sync", "--no-visualize", "--no-overlay", "--champion", "Ahri",
+             "--effective_damage", "120"]
+        )
+    out = capsys.readouterr().out
+    assert "explicit value wins" in out

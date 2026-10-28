@@ -41,6 +41,7 @@ class FrameStats:
     eligible: int = 0
     kept: int = 0
     held: int = 0
+    hp_labels: int = 0
     health: list[float] = field(default_factory=list)
     stale: bool = False
     detection_age: float | None = None
@@ -86,6 +87,7 @@ def stats_from_frame(
         eligible=int(pipeline.get("eligible", 0)),
         kept=int(pipeline.get("kept", 0)),
         held=int(pipeline.get("held", 0)),
+        hp_labels=int(pipeline.get("hp_labels", 0)),
         health=[float(v) for v in pipeline.get("health", []) if isfinite(float(v))],
         stale=bool(pipeline.get("stale", False)),
         detection_age=detection_age_seconds,
@@ -121,6 +123,7 @@ def format_stats(
         f"geo bars={stats.locator_matches}) hp=[{health}] | "
         f"eligible={stats.eligible} drawn={stats.kept}"
         + (f" (held {stats.held})" if stats.held else "")
+        + (f" hp_labels={stats.hp_labels}" if stats.hp_labels else "")
         + " | "
         f"infer={_ms(stats.inference_seconds)} box_age={_ms(stats.detection_age)}"
     )
