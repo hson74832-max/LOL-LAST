@@ -94,8 +94,16 @@ if not exist "yolov9\models\common.py" (
 
 if not exist "weights" mkdir "weights"
 if not exist "weights\best.pt" (
-    echo [NOTE] Model weights were not found at .\weights\best.pt.
-    echo        Download the trained YOLOv9 weights and place them at .\weights\best.pt before running.
+    echo [INFO] Checking/downloading trained YOLOv9 weights to .\weights\best.pt ...
+    %TARGET_PYTHON% -c "from my_utils.modules.detector import ensure_default_weights; ensure_default_weights()"
+    if errorlevel 1 (
+        echo [WARNING] Could not download .\weights\best.pt automatically.
+        echo           Please download best.pt from:
+        echo           https://drive.google.com/file/d/135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo/view?usp=share_link
+        echo           and place it at .\weights\best.pt before running.
+    )
+) else (
+    echo [INFO] .\weights\best.pt is already present.
 )
 
 echo.

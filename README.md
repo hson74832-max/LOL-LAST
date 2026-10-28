@@ -20,7 +20,7 @@ This script automatically:
 1. Detects your Python 3 installation and creates a local `.venv` virtual environment (pass `--system` to install globally instead).
 2. Upgrades `pip`, `setuptools`, and `wheel`.
 3. Installs all dependencies from `requirements.txt`.
-4. Clones `WongKinYiu/yolov9` into `./yolov9` if it is not already present and prepares `./weights`.
+4. Clones `WongKinYiu/yolov9` into `./yolov9` if it is not already present and automatically downloads `./weights/best.pt`.
 
 ### Linux / macOS (Shell Script)
 ```bash
@@ -28,7 +28,7 @@ This script automatically:
 ```
 
 ### Model Weights
-Download the trained YOLOv9 weights from [this link](https://drive.google.com/file/d/135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo/view?usp=share_link) and place `best.pt` inside `./weights/best.pt`.
+`install_requirements.bat`, `install_requirements.sh`, and `main.py` all automatically download `weights/best.pt` on first run if it is missing. If you prefer to download it manually, grab the trained YOLOv9 weights from [this link](https://drive.google.com/file/d/135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo/view?usp=share_link) and place `best.pt` inside `./weights/best.pt` (placing it in the project root or `~/Downloads/best.pt` is also detected automatically).
 
 ## Usage
 

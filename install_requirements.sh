@@ -67,8 +67,15 @@ fi
 
 mkdir -p weights
 if [[ ! -f "weights/best.pt" ]]; then
-    echo "[NOTE] Model weights were not found at ./weights/best.pt."
-    echo "       Download the trained YOLOv9 weights and place them at ./weights/best.pt before running."
+    echo "[INFO] Checking/downloading trained YOLOv9 weights to ./weights/best.pt ..."
+    if ! "$TARGET_PYTHON" -c "from my_utils.modules.detector import ensure_default_weights; ensure_default_weights()"; then
+        echo "[WARNING] Could not download ./weights/best.pt automatically."
+        echo "          Download the trained YOLOv9 weights from:"
+        echo "          https://drive.google.com/file/d/135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo/view?usp=share_link"
+        echo "          and place them at ./weights/best.pt before running."
+    fi
+else
+    echo "[INFO] ./weights/best.pt is already present."
 fi
 
 echo ""
