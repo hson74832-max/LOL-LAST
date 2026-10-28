@@ -28,8 +28,7 @@ def resize_image(image, width=None, height=None):
         raise ValueError("resize dimensions must be positive")
     if (width, height) == (original_width, original_height):
         return image
-    interpolation = cv2.INTER_AREA if width < original_width or height < original_height else cv2.INTER_LINEAR
-    return cv2.resize(image, (width, height), interpolation=interpolation)
+    return cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
 def mask_window(image, monitor, window_rect, margin=24):
@@ -57,12 +56,20 @@ def mask_window(image, monitor, window_rect, margin=24):
 
 
 def resize_excluded_regions(regions, old_shape, new_shape):
+    if not regions or old_shape[:2] == new_shape[:2]:
+        return tuple(regions)
     old_height, old_width = old_shape[:2]
     new_height, new_width = new_shape[:2]
     scale_x, scale_y = new_width / old_width, new_height / old_height
-    return tuple((max(0, floor(x1 * scale_x) - 2), max(0, floor(y1 * scale_y) - 2),
-                  min(new_width, ceil(x2 * scale_x) + 2), min(new_height, ceil(y2 * scale_y) + 2))
-                 for x1, y1, x2, y2 in regions)
+    return tuple(
+        (
+            max(0, floor(x1 * scale_x) - 2),
+            max(0, floor(y1 * scale_y) - 2),
+            min(new_width, ceil(x2 * scale_x) + 2),
+            min(new_height, ceil(y2 * scale_y) + 2),
+        )
+        for x1, y1, x2, y2 in regions
+    )
 
 
 class FrameLoader:
@@ -83,6 +90,11 @@ class FrameLoader:
     def grab(self, window_rect=None):
         captured_at = monotonic()
         raw = np.asarray(self.sct.grab(self.monitor))
+        if window_rect is None:
+            resized = resize_image(raw, self.width, self.height)
+            image = cv2.cvtColor(resized, cv2.COLOR_BGRA2BGR)
+            return CapturedFrame(image, captured_at, ())
+
         image = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
         image, regions = mask_window(image, self.monitor, window_rect)
         old_shape = image.shape

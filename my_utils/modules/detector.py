@@ -292,8 +292,8 @@ class Detector:
         weight_path: str | Path = DEFAULT_WEIGHTS_PATH,
         device: str | None = None,
         dnn: bool = False,
-        half: bool = False,
-        imgsz: tuple[int, int] = (960, 960),
+        half: bool | None = None,
+        imgsz: tuple[int, int] | int = (640, 640),
         conf_thres: float = 0.15,
         iou_thres: float = 0.45,
         backend=None,
@@ -303,7 +303,15 @@ class Detector:
             raise ValueError("confidence threshold must be in (0, 1]")
         if not 0 < float(iou_thres) <= 1:
             raise ValueError("IoU threshold must be in (0, 1]")
-        self.imgsz = imgsz
+        if isinstance(imgsz, int):
+            if imgsz <= 0:
+                raise ValueError("imgsz must be positive")
+            self.imgsz = (int(imgsz), int(imgsz))
+        else:
+            if len(imgsz) != 2 or min(imgsz) <= 0:
+                raise ValueError("imgsz must be a pair of positive integers")
+            self.imgsz = (int(imgsz[0]), int(imgsz[1]))
+
         self.conf_thres = float(conf_thres)
         self.iou_thres = float(iou_thres)
 
@@ -321,13 +329,31 @@ class Detector:
             )
             resolved_device_str = device or select_default_device(torch)
             resolved_device = torch.device(resolved_device_str)
+            use_half = (resolved_device.type == "cuda") if half is None else bool(half)
+            if resolved_device.type == "cuda" and hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.benchmark = True
+
             DetectMultiBackend, letterbox, non_max_suppression, scale_boxes = _load_yolov9_symbols()
             with _torch_load_compat(torch):
                 self.model = DetectMultiBackend(
                     str(resolved_weight_path),
                     device=resolved_device,
                     dnn=dnn,
-                    fp16=half,
+                    fp16=use_half,
+                )
+            if hasattr(self.model, "warmup") and resolved_device.type == "cuda":
+                try:
+                    self.model.warmup(imgsz=(1, 3, *self.imgsz))
+                except Exception:
+                    pass
+            print(
+                f"[INFO] Detector initialized on device={resolved_device} "
+                f"(fp16={getattr(self.model, 'fp16', use_half)}, imgsz={self.imgsz})"
+            )
+            if resolved_device.type == "cpu":
+                print(
+                    "[NOTE] Running on CPU. If you have an NVIDIA GPU on Windows, "
+                    "re-run run.bat or install_requirements.bat to enable CUDA acceleration."
                 )
             self._letterbox = letterbox
             self._nms = non_max_suppression
@@ -363,13 +389,11 @@ class Detector:
 
     def detect_objects(self, img: np.ndarray):
         torch = self._torch
-        im0 = np.ascontiguousarray(img)
-        im = self._letterbox(im0, self.imgsz, stride=self.stride, auto=self.pt)[0]
-        im = im.transpose((2, 0, 1))[::-1]  # HWC BGR -> CHW RGB
-        im = np.ascontiguousarray(im)
+        im = self._letterbox(img, self.imgsz, stride=self.stride, auto=self.pt)[0]
+        im = np.ascontiguousarray(im.transpose((2, 0, 1))[::-1])  # HWC BGR -> CHW RGB
 
         with torch.no_grad():
-            tensor = torch.from_numpy(im).to(self.model.device)
+            tensor = torch.from_numpy(im).to(self.model.device, non_blocking=True)
             tensor = tensor.half() if getattr(self.model, "fp16", False) else tensor.float()
             tensor /= 255.0
             if tensor.ndim == 3:
@@ -379,7 +403,7 @@ class Detector:
             pred = _unwrap_predictions(raw_pred)
             pred = self._nms(pred, conf_thres=self.conf_thres, iou_thres=self.iou_thres)
 
-        return self._classify_detections(pred, tensor.shape[2:], im0.shape)
+        return self._classify_detections(pred, tensor.shape[2:], img.shape)
 
     def _classify_detections(self, pred, input_hw, orig_shape):
         red_minions = []
@@ -395,10 +419,11 @@ class Detector:
             if self._scale_boxes is not None:
                 det[:, :4] = self._scale_boxes(input_hw, det[:, :4], orig_shape)
 
-            for *xyxy, conf, cls in reversed(det):
-                box = tuple(float(v.item() if hasattr(v, "item") else v) for v in xyxy)
-                confidence = float(conf.item() if hasattr(conf, "item") else conf)
-                class_id = int(cls.item() if hasattr(cls, "item") else cls)
+            det_np = det.detach().cpu().numpy() if hasattr(det, "detach") else np.asarray(det)
+            for row in det_np[::-1]:
+                box = (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+                confidence = float(row[4])
+                class_id = int(row[5])
                 label = self.names.get(class_id)
                 if label not in KNOWN_LABELS:
                     continue

@@ -7,6 +7,7 @@ No game process memory access or mouse/keyboard input injection is performed.
 """
 
 import argparse
+import threading
 import cv2
 import numpy as np
 
@@ -23,6 +24,55 @@ DEFAULT_MAX_HEALTH = {
     "melee": 500.0,
     "siege": 1500.0,
 }
+
+
+class _AsyncDetectionWorker:
+    """Runs YOLOv9 inference on the most recent frame without building a queue backlog."""
+
+    def __init__(self, detector: Detector) -> None:
+        self.detector = detector
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._pending_frame: CapturedFrame | None = None
+        self._latest: tuple[CapturedFrame, dict] | None = None
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name="LastHitDetectorWorker", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, frame: CapturedFrame) -> None:
+        with self._lock:
+            self._pending_frame = frame
+            self._event.set()
+
+    def get_latest(self) -> tuple[CapturedFrame, dict] | None:
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while True:
+            self._event.wait(timeout=0.1)
+            with self._lock:
+                if self._stopped:
+                    return
+                frame = self._pending_frame
+                self._pending_frame = None
+                self._event.clear()
+
+            if frame is None:
+                continue
+
+            detection_result = self.detector(frame.image)
+            with self._lock:
+                self._latest = (frame, detection_result)
 
 
 def _parse_bool(value: str | bool) -> bool:
@@ -74,14 +124,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--H",
         type=int,
-        default=2234 // 2,
-        help="Target frame height in pixels.",
+        default=720,
+        help="Target frame height in pixels (default 720 for low-latency processing).",
     )
     parser.add_argument(
         "--W",
         type=int,
-        default=3456 // 2,
-        help="Target frame width in pixels.",
+        default=1280,
+        help="Target frame width in pixels (default 1280 for low-latency processing).",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="YOLOv9 inference resolution (default 640 for lower latency; use 960 for max range).",
+    )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Run capture and inference synchronously instead of using the low-latency async pipeline.",
     )
     parser.add_argument(
         "--preview_W",
@@ -193,6 +254,51 @@ def process_frame(
     return candidates, visualized
 
 
+def evaluate_with_latest_detections(
+    captured_frame: CapturedFrame,
+    latest_detection: tuple[CapturedFrame, dict] | None,
+    object_associator: ObjectAssociator,
+    advisor: LastHitAdvisor,
+    annotator: AIAnnotator | None = None,
+    minion_color: str = "red",
+) -> tuple[list[LastHitCandidate], np.ndarray | None]:
+    """Re-evaluate health bars on the live frame using the newest detector boxes."""
+    if latest_detection is None:
+        visualized = (
+            annotator(candidates=[], img=captured_frame.image, copy=False)
+            if annotator is not None
+            else None
+        )
+        return [], visualized
+
+    det_frame, detection_result = latest_detection
+    matched_minions = object_associator(
+        detection_result,
+        img=captured_frame.image,
+        minion_type=minion_color,
+        excluded_regions=captured_frame.excluded_regions,
+    )
+    if (
+        not matched_minions
+        and det_frame is not captured_frame
+        and (captured_frame.captured_at - det_frame.captured_at) <= 0.6
+    ):
+        matched_minions = object_associator(
+            detection_result,
+            img=det_frame.image,
+            minion_type=minion_color,
+            excluded_regions=det_frame.excluded_regions,
+        )
+
+    candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    visualized = (
+        annotator(candidates=candidates, img=captured_frame.image, copy=False)
+        if annotator is not None
+        else None
+    )
+    return candidates, visualized
+
+
 def _get_preview_window_rect(window_title: str) -> tuple[int, int, int, int] | None:
     try:
         rect = cv2.getWindowImageRect(window_title)
@@ -206,7 +312,13 @@ def _get_preview_window_rect(window_title: str) -> tuple[int, int, int, int] | N
     return int(x), int(y), int(w), int(h)
 
 
-def _init_preview_window(window_title: str, frame_w: int, frame_h: int, preview_w: int | None, preview_h: int | None) -> None:
+def _init_preview_window(
+    window_title: str,
+    frame_w: int,
+    frame_h: int,
+    preview_w: int | None,
+    preview_h: int | None,
+) -> None:
     """Create a resizable preview window that scales the full frame instead of cropping it."""
     target_w = preview_w if (preview_w is not None and preview_w > 0) else min(frame_w, 1280)
     target_h = preview_h if (preview_h is not None and preview_h > 0) else min(frame_h, 720)
@@ -236,10 +348,18 @@ def main(argv: list[str] | None = None) -> int:
         max_distance=args.max_distance,
     )
 
-    detector = Detector(weight_path=args.weights, device=args.device)
+    detector = Detector(
+        weight_path=args.weights,
+        device=args.device,
+        imgsz=(args.imgsz, args.imgsz),
+    )
     object_associator = ObjectAssociator(min_confidence=args.min_confidence)
     advisor = LastHitAdvisor(settings)
     annotator = AIAnnotator() if args.visualize else None
+
+    worker = None if args.sync else _AsyncDetectionWorker(detector)
+    if worker is not None:
+        worker.start()
 
     window_created = False
     warned_black_frame = False
@@ -263,14 +383,25 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     warned_black_frame = True
 
-                _, visualized = process_frame(
-                    captured_frame=captured,
-                    detector=detector,
-                    object_associator=object_associator,
-                    advisor=advisor,
-                    annotator=annotator,
-                    minion_color=args.minion_color,
-                )
+                if worker is not None:
+                    worker.submit(captured)
+                    _, visualized = evaluate_with_latest_detections(
+                        captured_frame=captured,
+                        latest_detection=worker.get_latest(),
+                        object_associator=object_associator,
+                        advisor=advisor,
+                        annotator=annotator,
+                        minion_color=args.minion_color,
+                    )
+                else:
+                    _, visualized = process_frame(
+                        captured_frame=captured,
+                        detector=detector,
+                        object_associator=object_associator,
+                        advisor=advisor,
+                        annotator=annotator,
+                        minion_color=args.minion_color,
+                    )
 
                 if args.visualize and visualized is not None:
                     if not window_created:
@@ -284,6 +415,8 @@ def main(argv: list[str] | None = None) -> int:
                         window_created = True
                     cv2.imshow(WINDOW_TITLE, visualized)
         finally:
+            if worker is not None:
+                worker.stop()
             if window_created:
                 cv2.destroyAllWindows()
 

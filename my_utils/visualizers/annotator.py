@@ -24,18 +24,22 @@ class AIAnnotator:
         self,
         candidates: list[LastHitCandidate],
         img: np.ndarray,
+        copy: bool = True,
     ) -> np.ndarray:
-        return self.annotate_candidates(img, candidates)
+        return self.annotate_candidates(img, candidates, copy=copy)
 
     def annotate_candidates(
         self,
         img: np.ndarray,
         candidates: list[LastHitCandidate],
+        copy: bool = True,
     ) -> np.ndarray:
         if not isinstance(img, np.ndarray) or img.ndim != 3 or img.shape[2] != 3:
             raise ValueError("frame must be a 3-channel BGR image")
 
-        canvas = img.copy()
+        canvas = img.copy() if copy else img
+        if not candidates:
+            return canvas
         height, width = canvas.shape[:2]
 
         # Draw lower-priority candidates first so the #1 priority target is never occluded.

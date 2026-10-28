@@ -75,6 +75,15 @@ if errorlevel 1 (
     goto :fail
 )
 
+where nvidia-smi >nul 2>nul
+if not errorlevel 1 (
+    %TARGET_PYTHON% -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
+    if errorlevel 1 (
+        echo [INFO] NVIDIA GPU detected. Installing CUDA-enabled PyTorch for low-latency GPU inference...
+        %TARGET_PYTHON% -m pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    )
+)
+
 if not exist "yolov9\models\common.py" (
     echo [INFO] Setting up YOLOv9 repository in .\yolov9 ...
     where git >nul 2>nul
