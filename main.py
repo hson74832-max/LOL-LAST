@@ -8,6 +8,7 @@ No game process memory access or mouse/keyboard input injection is performed.
 
 import argparse
 import cv2
+import numpy as np
 
 from my_utils.loaders.frame_loader import CapturedFrame, FrameLoader
 from my_utils.modules.algorithms import ObjectAssociator
@@ -81,6 +82,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=3456 // 2,
         help="Target frame width in pixels.",
+    )
+    parser.add_argument(
+        "--preview_W",
+        type=int,
+        default=None,
+        help="Initial width of the resizable preview window (defaults to min(W, 1280)).",
+    )
+    parser.add_argument(
+        "--preview_H",
+        type=int,
+        default=None,
+        help="Initial height of the resizable preview window (defaults to min(H, 720)).",
+    )
+    parser.add_argument(
+        "--mask_preview",
+        action="store_true",
+        help="Mask out the preview window's desktop rectangle from captured frames.",
     )
     parser.add_argument(
         "--effective_damage",
@@ -157,7 +175,7 @@ def process_frame(
     advisor: LastHitAdvisor,
     annotator: AIAnnotator | None = None,
     minion_color: str = "red",
-) -> tuple[list[LastHitCandidate], object]:
+) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Evaluate a single frame and return (prioritized_last_hit_candidates, visualized_frame)."""
     detection_result = detector(captured_frame.image)
     matched_minions = object_associator(
@@ -188,6 +206,14 @@ def _get_preview_window_rect(window_title: str) -> tuple[int, int, int, int] | N
     return int(x), int(y), int(w), int(h)
 
 
+def _init_preview_window(window_title: str, frame_w: int, frame_h: int, preview_w: int | None, preview_h: int | None) -> None:
+    """Create a resizable preview window that scales the full frame instead of cropping it."""
+    target_w = preview_w if (preview_w is not None and preview_w > 0) else min(frame_w, 1280)
+    target_h = preview_h if (preview_h is not None and preview_h > 0) else min(frame_h, 720)
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_title, int(target_w), int(target_h))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -216,14 +242,27 @@ def main(argv: list[str] | None = None) -> int:
     annotator = AIAnnotator() if args.visualize else None
 
     window_created = False
+    warned_black_frame = False
     with FrameLoader(monitor_idx=args.monitor_idx, width=args.W, height=args.H) as frame_loader:
         try:
             while True:
                 if args.visualize and window_created and (cv2.waitKey(1) & 0xFF == ord("q")):
                     break
 
-                window_rect = _get_preview_window_rect(WINDOW_TITLE) if window_created else None
+                window_rect = (
+                    _get_preview_window_rect(WINDOW_TITLE)
+                    if (args.mask_preview and window_created)
+                    else None
+                )
                 captured = frame_loader.grab(window_rect=window_rect)
+                if not warned_black_frame and not np.any(captured.image):
+                    print(
+                        "[WARNING] Captured frame is completely black. "
+                        "If League of Legends is in Exclusive Fullscreen mode, switch in-game Video settings "
+                        "to 'Borderless' or 'Windowed'."
+                    )
+                    warned_black_frame = True
+
                 _, visualized = process_frame(
                     captured_frame=captured,
                     detector=detector,
@@ -234,8 +273,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
                 if args.visualize and visualized is not None:
+                    if not window_created:
+                        _init_preview_window(
+                            WINDOW_TITLE,
+                            frame_w=visualized.shape[1],
+                            frame_h=visualized.shape[0],
+                            preview_w=args.preview_W,
+                            preview_h=args.preview_H,
+                        )
+                        window_created = True
                     cv2.imshow(WINDOW_TITLE, visualized)
-                    window_created = True
         finally:
             if window_created:
                 cv2.destroyAllWindows()
