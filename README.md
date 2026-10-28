@@ -9,9 +9,35 @@ This repository provides a **read-only, non-injection** visual companion for ide
 - **Only Last-Hittable Minions Shown**: Minions whose conservative upper-bound HP exceeds your configured effective attack damage—or whose detection/health-bar reading is ambiguous, clipped, or low-confidence—are excluded and never rendered.
 - **Minion Prioritization Preserved**: Eligible last-hittable minions are ranked by distance to the player anchor (`#1` nearest priority target highlighted in yellow, `#2+` secondary last-hittable minions in green), with deterministic tie-breaking by remaining HP upper bound and bounding box.
 
+## Installation
+
+### Windows (Batch File)
+Double-click **`install_requirements.bat`** or run it from Command Prompt / PowerShell:
+```bat
+install_requirements.bat
+```
+This script automatically:
+1. Detects your Python 3 installation and creates a local `.venv` virtual environment (pass `--system` to install globally instead).
+2. Upgrades `pip`, `setuptools`, and `wheel`.
+3. Installs all dependencies from `requirements.txt`.
+4. Clones `WongKinYiu/yolov9` into `./yolov9` if it is not already present and prepares `./weights`.
+
+### Linux / macOS (Shell Script)
+```bash
+./install_requirements.sh
+```
+
+### Model Weights
+Download the trained YOLOv9 weights from [this link](https://drive.google.com/file/d/135Bt-YX-Aqa_oaBxN220YSe9uGWiuljo/view?usp=share_link) and place `best.pt` inside `./weights/best.pt`.
+
 ## Usage
 
-Run the companion using `main.py`:
+On Windows, you can launch the companion using **`run.bat`** (which automatically uses `.venv` and installs requirements if needed):
+```bat
+run.bat --monitor_idx 1 --visualize True --minion_color red --H 540 --W 960 --effective_damage 80
+```
+
+Or run `main.py` directly with Python:
 ```bash
 python main.py --monitor_idx 1 --visualize True --minion_color red --H 540 --W 960 --effective_damage 80
 ```

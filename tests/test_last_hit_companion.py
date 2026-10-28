@@ -57,7 +57,7 @@ def test_no_injection_dependencies_or_calls():
     python_files = [
         p
         for p in REPO_ROOT.rglob("*.py")
-        if ".venv" not in p.parts and "tests" not in p.parts
+        if ".venv" not in p.parts and "tests" not in p.parts and "yolov9" not in p.parts
     ]
     assert python_files
 
@@ -371,3 +371,31 @@ def test_window_masking_and_resizing():
     scaled_regions = resize_excluded_regions(regions, masked.shape, resized.shape)
     assert resized.shape == (100, 150, 3)
     assert len(scaled_regions) == 1
+
+
+def test_installer_scripts_and_requirements_file():
+    from packaging.requirements import Requirement
+
+    req_lines = [
+        line.strip()
+        for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert req_lines
+    for line in req_lines:
+        # Must be valid PEP 508 requirement specifiers (no broken git+ yolov9 URL without setup.py)
+        req = Requirement(line)
+        assert req.name.lower() != "pynput"
+        assert "yolov9" not in line.lower()
+
+    install_bat = (REPO_ROOT / "install_requirements.bat").read_text(encoding="utf-8")
+    assert "pip install -r requirements.txt" in install_bat
+    assert "https://github.com/WongKinYiu/yolov9.git" in install_bat
+
+    run_bat = (REPO_ROOT / "run.bat").read_text(encoding="utf-8")
+    assert "install_requirements.bat" in run_bat
+    assert "main.py" in run_bat
+
+    install_sh = (REPO_ROOT / "install_requirements.sh").read_text(encoding="utf-8")
+    assert "pip install -r requirements.txt" in install_sh
+    assert "https://github.com/WongKinYiu/yolov9.git" in install_sh
