@@ -13,7 +13,7 @@ import numpy as np
 
 from my_utils.loaders.frame_loader import CapturedFrame, FrameLoader
 from my_utils.modules.algorithms import ObjectAssociator
-from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector
+from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector, diagnose_devices
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.modules.stability import CandidateGate
 from my_utils.visualizers.annotator import AIAnnotator
@@ -319,6 +319,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "on Windows, needs torch-directml). Auto-detected if omitted."
         ),
     )
+    parser.add_argument(
+        "--strict_device",
+        action="store_true",
+        help=(
+            "Fail with an error if the requested --device is unavailable instead of "
+            "warning and falling back to CPU inference."
+        ),
+    )
+    parser.add_argument(
+        "--check-devices",
+        action="store_true",
+        help=(
+            "Print which inference backends (CUDA / MPS / DirectML / CPU) are available, "
+            "what is missing and how to install it, then exit."
+        ),
+    )
     return parser
 
 
@@ -469,6 +485,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{idx}] {monitor}")
         return 0
 
+    if args.check_devices:
+        print("[INFO] Inference backend diagnostics")
+        for line in diagnose_devices():
+            print(f"[INFO] {line}" if line else "")
+        return 0
+
     if args.confirm_frames < 1:
         parser.error("--confirm_frames must be at least 1")
     if not 0 < args.min_bar_confidence <= 1:
@@ -491,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         weight_path=args.weights,
         device=args.device,
         imgsz=(args.imgsz, args.imgsz),
+        strict_device=args.strict_device,
     )
     object_associator = ObjectAssociator(
         min_confidence=args.min_confidence,

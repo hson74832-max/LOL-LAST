@@ -32,6 +32,39 @@ The detector runs on whatever backend is available; it never silently requires C
 - DirectML runs in fp32 (no fp16 support) and is slower than CUDA, but much faster than CPU.
 - If the detector starts on CPU, `main.py` prints the exact commands to enable GPU inference — CPU inference is also the most common reason markers lag behind the game.
 
+### Check your backend first
+```bat
+run.bat --check-devices
+```
+prints Python/torch versions, whether CUDA, MPS and DirectML are usable, **why** the missing one is missing, the exact fix command, and the backend that would be selected. It never installs anything.
+
+Example output on an AMD machine without DirectML installed:
+```
+[INFO] Inference backend diagnostics
+[INFO] Python              : 3.11.9 (64-bit) at C:\...\.venv\Scripts\python.exe
+[INFO] torch               : 2.9.0+cpu
+[INFO] CUDA (NVIDIA)       : not available
+[INFO] Apple MPS           : not available
+[INFO] DirectML (AMD/Intel): not available - torch-directml is not installed (ModuleNotFoundError: No module named 'torch_directml')
+[INFO]                       Fix: .venv\Scripts\python.exe -m pip install torch-directml
+[INFO]                       (separate package from PyTorch; downgrades torch to 2.4.1)
+[INFO] Selected backend    : cpu
+[INFO] Expected speed     : slow (CPU). Markers will lag behind the game.
+```
+
+### "pytorch is already installed" but DirectML is missing
+`torch` and `torch-directml` are **different packages** — installing PyTorch does not install DirectML. Also note:
+
+- Install it **into the project's venv** (the interpreter `run.bat` uses), otherwise Python cannot see it:
+  ```bat
+  .venv\Scripts\python.exe -m pip install torch-directml
+  ```
+  or simply `install_requirements.bat --directml`.
+- Windows only, **64-bit Python 3.8 – 3.12** (no wheels for 3.13+). The installer verifies this before trying.
+- `torch-directml` pins `torch==2.4.1` and `torchvision==0.19.1`, so pip **downgrades** torch. That is expected and supported by this project.
+- If `--device directml` is requested but unavailable, the companion prints the reason and the fix, then keeps running on CPU instead of crashing. Add `--strict_device` if you prefer a hard error.
+- `torch_directml.is_available()` returning `False` on a machine that has it installed usually means an outdated AMD/Intel driver or a CPU-only torch build — `run.bat --check-devices` shows which one it is.
+
 Check the first lines of console output, they state the device explicitly, e.g.:
 ```
 [INFO] Detector initialized on device=privateuseone:0 [DirectML] (fp16=False, imgsz=(640, 640))
@@ -118,3 +151,5 @@ python main.py --list-monitors
 - `--player_anchor`: Normalized `(x, y)` anchor in `[0, 1]` for distance prioritization (default `0.5 0.5`).
 - `--max_distance`: Optional maximum pixel distance from the player anchor.
 - `--device`: `cpu`, `cuda:0` (NVIDIA), `mps` (Apple) or `directml` (AMD/Intel on Windows). Auto-detected when omitted.
+- `--strict_device`: Fail instead of falling back to CPU when the requested `--device` is unavailable.
+- `--check-devices`: Print the inference-backend diagnostics (CUDA / MPS / DirectML / CPU) and exit.

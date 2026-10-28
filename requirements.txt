@@ -15,3 +15,8 @@ setuptools<81.0.0
 torch>=2.2.0
 torchvision>=0.17.0
 tqdm>=4.64.0
+# Optional AMD/Intel GPU acceleration (Windows only, 64-bit Python 3.8-3.12).
+# torch-directml is a SEPARATE package from torch; it pins torch==2.4.1 and
+# torchvision==0.19.1, so `pip install torch-directml` downgrades torch.
+# Install with: install_requirements.bat --directml
+# torch-directml>=0.2.5
