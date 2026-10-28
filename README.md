@@ -18,6 +18,29 @@ This repository provides a **read-only, non-injection** visual companion for ide
 
 Overlay markers are small triangles drawn above each minion's head (`--overlay_gap`, default 16 px) so they never cover a health bar and never corrupt the next frame's health reading. Like screen capture, the overlay requires the game to run in **Borderless** or **Windowed** mode; Exclusive Fullscreen hides any external window.
 
+## Letting the game keep its frames (performance)
+The companion never injects anything, but it can still cost the game frames if it keeps the GPU and CPU busy back-to-back. Three dials control that:
+
+| Dial | Default | What it does |
+| --- | --- | --- |
+| `--infer_fps` | `12` | Maximum YOLO inferences per second. **The biggest lever.** Each inference is ~25 ms on DirectML; at unlimited rate the GPU never idles. 10–15 fps of detection is plenty for last hits because health bars are re-read on every captured frame (that part is ~1–4 ms). |
+| `--max_fps` | `30` | Capture/processing loop rate. Each iteration costs ~4.5 ms of CPU at 1280×720 (capture, bar reads, drawing), so an unlimited loop pegs a whole core. `30` keeps it near ~15 % of one core. |
+| `--overlay_fps` | `30` | Overlay redraw rate (each redraw is a Tk window update). |
+| `--priority` | `below` | Sets **this process'** OS priority (`below` = below normal, `lowest` = idle class on Windows). It lets Windows give the game's threads the CPU first. Never touches the game process. |
+| `--torch_threads` | unset | Limits PyTorch intra-op threads; useful on CPU inference so the game keeps cores (e.g. `--torch_threads 4`). |
+
+Recommended when the game stutters:
+```bat
+run.bat --imgsz 512 --H 720 --W 1280 --infer_fps 10 --max_fps 24 --priority lowest --no-visualize --bar_locator True --confirm_frames 2
+```
+Measured effect of `--infer_fps`: detection work drops from ~40 inferences/s to 10 — roughly **a 75 % cut in GPU time** — while markers stay responsive because health bars are still re-read up to `--max_fps` times per second.
+
+Debug output now also reports per-stage timings, so you can see where time goes:
+```
+[DEBUG] ... | infer=24ms box_age=31ms | capture=6.1ms evaluate=4.3ms overlay=0.9ms preview=1.8ms loop=38.0ms
+```
+`--debug` itself is cheap now: brightness is measured on a 4×4 sub-sample and the annotated PNG is encoded on a background thread (it used to cost 15–25 ms per second on the capture loop).
+
 ## GPU Support (NVIDIA / AMD / Intel / Apple)
 The detector runs on whatever backend is available; it never silently requires CUDA:
 
@@ -171,6 +194,36 @@ Inspect available monitor indices:
 python main.py --list-monitors
 ```
 
+## Command reference
+Everything is a flag on `run.bat` (Windows) or `main.py`; `run.bat --help` prints the same list.
+
+Diagnostics / setup:
+| Command | Purpose |
+| --- | --- |
+| `run.bat --check-devices` | Which backend (CUDA / MPS / DirectML / CPU) is usable and how to fix it |
+| `run.bat --list-monitors` | Monitor indices for `--monitor_idx` |
+| `run.bat --debug` | Per-frame diagnostics + `frames/debug/latest.png` + speed tips |
+| `install_requirements.bat --directml` | Install AMD/Intel GPU support (torch-directml) |
+| `install_requirements.bat --system` | Install into the system Python instead of `.venv` |
+
+Display:
+| Flag | Purpose |
+| --- | --- |
+| `--visualize` / `--no-visualize` | Capture preview window (markers drawn in it) |
+| `--overlay` / `--no-overlay` | Click-through markers on the game screen |
+| `--overlay_fps`, `--overlay_gap` | Overlay redraw rate, marker distance above the minion |
+| `--preview_W`, `--preview_H`, `--mask_preview` | Preview window size, mask it out of the capture |
+| `--monitor_idx` | Which monitor to capture |
+
+Performance:
+`--infer_fps`, `--max_fps`, `--priority`, `--torch_threads`, `--imgsz`, `--H`, `--W`, `--sync`.
+
+Detection / strictness:
+`--min_confidence`, `--min_bar_confidence`, `--max_detection_age`, `--confirm_frames`, `--bar_locator` / `--no-bar_locator`, `--stale_frame_fallback`, `--device`, `--strict_device`, `--weights`.
+
+Last-hit maths:
+`--effective_damage`, `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`, `--health_margin`, `--minion_color`, `--player_anchor`, `--max_distance`.
+
 ### Parameters
 - `--monitor_idx`: Monitor index to capture screenshots from.
 - `--visualize` / `--no-visualize`: Enable or disable the read-only preview window.
@@ -188,6 +241,11 @@ python main.py --list-monitors
 - `--max_detection_age`: Maximum age in seconds of detector boxes reused on a live frame (default `0.35`, `0` disables).
 - `--confirm_frames`: Consecutive detector results a candidate must be seen in before it is drawn (default `2`).
 - `--bar_locator` / `--no-bar_locator`: Read health bars geometrically around each body when YOLOv9 reports none (default on).
+- `--infer_fps`: Maximum YOLO inferences per second (default `12`, `0` = unlimited).
+- `--max_fps`: Maximum capture/processing frames per second (default `30`, `0` = unlimited).
+- `--overlay_fps`: Maximum overlay redraws per second (default `30`).
+- `--priority`: This process' priority: `normal`, `below` (default) or `lowest`.
+- `--torch_threads`: Limit PyTorch intra-op threads (CPU inference).
 - `--stale_frame_fallback`: Re-enable the legacy previous-frame fallback (off by default).
 - `--debug` / `--no-debug`: Per-frame diagnostics plus a one-line explanation of why no marker is drawn; writes `frames/debug/latest.png`.
 - `--debug_frames_dir`, `--debug_interval`: Where/how often the diagnostics write frames and lines.

@@ -16,6 +16,14 @@ from my_utils.loaders.frame_loader import CapturedFrame, FrameLoader
 from my_utils.modules.algorithms import ObjectAssociator
 from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector, diagnose_devices
 from my_utils.modules.diagnostics import DebugReporter, describe_thresholds, stats_from_frame
+from my_utils.modules.performance import (
+    FpsLimiter,
+    StageTimer,
+    apply_process_priority,
+    capture_and_processing_tips,
+    set_torch_threads,
+    validate_fps,
+)
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.modules.stability import CandidateGate
 from my_utils.visualizers.annotator import AIAnnotator
@@ -30,6 +38,10 @@ WINDOW_TITLE = "Last Hit Companion (Read-Only)"
 # Detections older than this are never drawn on a live frame: a stale bounding box
 # makes the companion point at minions that are already dead.
 DEFAULT_MAX_DETECTION_AGE = 0.35
+# Pacing defaults: inference is the expensive stage, so it runs well below the loop rate.
+DEFAULT_INFER_FPS = 12.0
+DEFAULT_LOOP_FPS = 30.0
+DEFAULT_OVERLAY_FPS = 30.0
 DEFAULT_CONFIRM_FRAMES = 2
 DEFAULT_BAR_MIN_CONFIDENCE = 0.20
 
@@ -43,16 +55,25 @@ DEFAULT_MAX_HEALTH = {
 class _AsyncDetectionWorker:
     """Runs YOLOv9 inference on the most recent frame without building a queue backlog."""
 
-    def __init__(self, detector: Detector) -> None:
+    def __init__(self, detector: Detector, max_fps: float = 0.0) -> None:
         self.detector = detector
         self.last_inference_seconds: float | None = None
         self.inference_count = 0
+        # Detection is the expensive stage: pacing it is what stops the game stuttering.
+        self.max_fps = validate_fps(max_fps, "inference fps")
+        self._min_interval = 1.0 / self.max_fps if self.max_fps else 0.0
+        self._next_inference = 0.0
         self._lock = threading.Lock()
         self._event = threading.Event()
         self._pending_frame: CapturedFrame | None = None
         self._latest: tuple[CapturedFrame, dict] | None = None
         self._stopped = False
         self._thread = threading.Thread(target=self._run, name="LastHitDetectorWorker", daemon=True)
+
+    @property
+    def stopped(self) -> bool:
+        with self._lock:
+            return self._stopped
 
     def start(self) -> None:
         self._thread.start()
@@ -75,7 +96,18 @@ class _AsyncDetectionWorker:
 
     def _run(self) -> None:
         while True:
-            self._event.wait(timeout=0.1)
+            self._event.wait(timeout=0.05)
+            if self.stopped:
+                return
+
+            if self._min_interval:
+                now = time.perf_counter()
+                if now < self._next_inference:
+                    # Keep the newest pending frame and wait for the next slot instead
+                    # of queueing work that would keep the GPU busy back-to-back.
+                    time.sleep(min(0.05, self._next_inference - now))
+                    continue
+
             with self._lock:
                 if self._stopped:
                     return
@@ -86,6 +118,8 @@ class _AsyncDetectionWorker:
             if frame is None:
                 continue
 
+            if self._min_interval:
+                self._next_inference = time.perf_counter() + self._min_interval
             started = time.perf_counter()
             detection_result = self.detector(frame.image)
             elapsed = time.perf_counter() - started
@@ -104,6 +138,13 @@ def _parse_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"expected a boolean value, got {value!r}")
+
+
+def _fps(value: str) -> float:
+    try:
+        return validate_fps(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _non_negative_float(value: str) -> float:
@@ -354,6 +395,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--infer_fps",
+        type=_fps,
+        default=DEFAULT_INFER_FPS,
+        help=(
+            "Maximum YOLO inferences per second (default 12; 0 = unlimited). "
+            "This is the main lever for how much the game is slowed down: detection at "
+            "10-15 fps is plenty for last hitting, while faster health-bar re-reads keep "
+            "the markers responsive."
+        ),
+    )
+    parser.add_argument(
+        "--max_fps",
+        type=_fps,
+        default=DEFAULT_LOOP_FPS,
+        help=(
+            "Maximum capture/processing loop rate in frames per second (default 30; "
+            "0 = unlimited). Lowering it reduces CPU load and window drawing."
+        ),
+    )
+    parser.add_argument(
+        "--overlay_fps",
+        type=_fps,
+        default=DEFAULT_OVERLAY_FPS,
+        help="Maximum overlay redraw rate (default 30).",
+    )
+    parser.add_argument(
+        "--priority",
+        choices=("normal", "below", "lowest"),
+        default="below",
+        help=(
+            "Priority of this companion process (default 'below'). 'lowest' gives the game "
+            "the most CPU time; 'normal' restores default scheduling. Windows: "
+            "below=below-normal, lowest=idle priority class."
+        ),
+    )
+    parser.add_argument(
+        "--torch_threads",
+        type=int,
+        default=None,
+        help=(
+            "Limit PyTorch intra-op threads (matters on CPU inference; default: leave "
+            "PyTorch's choice). On a 8-core CPU, e.g. --torch_threads 4 keeps cores free."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         nargs="?",
         const=True,
@@ -593,6 +679,14 @@ def main(argv: list[str] | None = None) -> int:
         max_distance=args.max_distance,
     )
 
+    priority_status = apply_process_priority(args.priority)
+    if priority_status:
+        print(f"[INFO] {priority_status}.")
+    if args.torch_threads is not None:
+        threads_status = set_torch_threads(args.torch_threads)
+        if threads_status:
+            print(f"[INFO] {threads_status}.")
+
     detector = Detector(
         weight_path=args.weights,
         device=args.device,
@@ -612,6 +706,15 @@ def main(argv: list[str] | None = None) -> int:
         f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}; "
         f"geometric health-bar reading {'on' if args.bar_locator else 'off'}."
     )
+    print(
+        f"[INFO] Pacing: capture loop {args.max_fps or 'unlimited'} fps, detection "
+        f"{args.infer_fps or 'unlimited'} fps, overlay {args.overlay_fps or 'unlimited'} fps."
+    )
+    if args.sync and args.infer_fps:
+        print(
+            "[NOTE] --sync runs inference inside the capture loop, so --infer_fps does not "
+            "apply; lower --max_fps to pace it (the default async pipeline is recommended)."
+        )
     annotator = AIAnnotator() if args.visualize else None
     reporter = (
         DebugReporter(
@@ -627,19 +730,23 @@ def main(argv: list[str] | None = None) -> int:
         for line in describe_thresholds(settings, args.minion_color):
             print(f"[INFO] {line}")
         print(f"[INFO] Annotated frames are written to {reporter.frames_dir}/latest.png")
+        for tip in capture_and_processing_tips(args.imgsz, args.W, args.H):
+            print(f"[INFO] speed tip: {tip}")
         if not args.visualize and not args.overlay:
             print(
                 "[NOTE] Both the preview window and the overlay are disabled, so no markers "
                 "can be displayed; --debug output is the only feedback."
             )
 
-    worker = None if args.sync else _AsyncDetectionWorker(detector)
+    worker = None if args.sync else _AsyncDetectionWorker(detector, max_fps=args.infer_fps)
     if worker is not None:
         worker.start()
 
     window_created = False
     warned_black_frame = False
     warned_stale_detections = False
+    limiter = FpsLimiter(args.max_fps)
+    timings = StageTimer()
     overlay: DesktopOverlay | None = None
     overlay_failed = not args.overlay
     if args.overlay:
@@ -650,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     with FrameLoader(monitor_idx=args.monitor_idx, width=args.W, height=args.H) as frame_loader:
         try:
             while True:
+                loop_started = time.perf_counter()
                 if args.visualize and window_created and (cv2.waitKey(1) & 0xFF == ord("q")):
                     break
 
@@ -658,7 +766,8 @@ def main(argv: list[str] | None = None) -> int:
                     if (args.mask_preview and window_created)
                     else None
                 )
-                captured = frame_loader.grab(window_rect=window_rect)
+                with timings.measure("capture"):
+                    captured = frame_loader.grab(window_rect=window_rect)
                 if not warned_black_frame and not np.any(captured.image):
                     print(
                         "[WARNING] Captured frame is completely black. "
@@ -668,6 +777,7 @@ def main(argv: list[str] | None = None) -> int:
                     warned_black_frame = True
 
                 pipeline_stats: dict | None = {} if reporter is not None else None
+                evaluate_started = time.perf_counter()
                 if worker is not None:
                     worker.submit(captured)
                     latest = worker.get_latest()
@@ -715,6 +825,8 @@ def main(argv: list[str] | None = None) -> int:
                         pipeline_stats=pipeline_stats,
                     )
 
+                timings.add("evaluate", time.perf_counter() - evaluate_started)
+
                 if reporter is not None:
                     detection_result = (pipeline_stats or {}).get("detection_result") or {}
                     if worker is not None:
@@ -733,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
                         detection_age_seconds=age_seconds,
                         inference_seconds=inference_seconds,
                     )
-                    reporter.report(stats)
+                    reporter.report(stats, timings=timings.averages())
                     reporter.save(
                         image=captured.image,
                         detection_result=detection_result,
@@ -746,13 +858,15 @@ def main(argv: list[str] | None = None) -> int:
                             monitor=frame_loader.monitor,
                             primary_width=frame_loader.primary_monitor["width"],
                             marker_gap=args.overlay_gap,
+                            max_fps=args.overlay_fps or 60.0,
                         )
                     except (OverlayUnavailable, ValueError) as exc:
                         overlay_failed = True
                         print(f"[WARNING] Desktop overlay disabled: {exc}")
 
                 if overlay is not None:
-                    overlay.render(candidates, captured.image.shape)
+                    with timings.measure("overlay"):
+                        overlay.render(candidates, captured.image.shape)
                     if overlay.closed:
                         overlay_failed = True
                         overlay = None
@@ -771,12 +885,18 @@ def main(argv: list[str] | None = None) -> int:
                             preview_h=args.preview_H,
                         )
                         window_created = True
-                    cv2.imshow(WINDOW_TITLE, visualized)
+                    with timings.measure("preview"):
+                        cv2.imshow(WINDOW_TITLE, visualized)
+
+                timings.add("loop", time.perf_counter() - loop_started)
+                limiter.sleep()
         finally:
             if worker is not None:
                 worker.stop()
             if overlay is not None:
                 overlay.close()
+            if reporter is not None:
+                reporter.close()
             if window_created:
                 cv2.destroyAllWindows()
 
