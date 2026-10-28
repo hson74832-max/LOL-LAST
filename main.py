@@ -16,6 +16,11 @@ from my_utils.modules.algorithms import ObjectAssociator
 from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
 from my_utils.visualizers.annotator import AIAnnotator
+from my_utils.visualizers.overlay import (
+    DEFAULT_MARKER_GAP,
+    DesktopOverlay,
+    OverlayUnavailable,
+)
 
 
 WINDOW_TITLE = "Last Hit Companion (Read-Only)"
@@ -84,6 +89,16 @@ def _parse_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"expected a boolean value, got {value!r}")
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not np.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
+    return number
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -160,6 +175,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mask_preview",
         action="store_true",
         help="Mask out the preview window's desktop rectangle from captured frames.",
+    )
+    parser.add_argument(
+        "--overlay",
+        nargs="?",
+        const=True,
+        default=True,
+        type=_parse_bool,
+        help=(
+            "Draw the last-hit markers as a click-through, always-on-top overlay on the "
+            "game screen itself (True/False, default True). Use --no-overlay to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-overlay",
+        dest="overlay",
+        action="store_false",
+        help="Disable the desktop overlay and only draw markers in the preview window.",
+    )
+    parser.add_argument(
+        "--overlay_gap",
+        type=_non_negative_float,
+        default=DEFAULT_MARKER_GAP,
+        help=(
+            "Distance in frame pixels between a minion's bounding box top and its overlay "
+            "marker, kept above the health bar (default 16)."
+        ),
     )
     parser.add_argument(
         "--effective_damage",
@@ -291,8 +332,10 @@ def evaluate_with_latest_detections(
         )
 
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    # The live frame was just handed to the detection worker; annotating it in
+    # place would let YOLOv9 read half-drawn boxes, so always render on a copy.
     visualized = (
-        annotator(candidates=candidates, img=captured_frame.image, copy=False)
+        annotator(candidates=candidates, img=captured_frame.image, copy=True)
         if annotator is not None
         else None
     )
@@ -363,6 +406,13 @@ def main(argv: list[str] | None = None) -> int:
 
     window_created = False
     warned_black_frame = False
+    overlay: DesktopOverlay | None = None
+    overlay_failed = not args.overlay
+    if args.overlay:
+        print(
+            "[INFO] Desktop overlay enabled: last-hit markers are drawn on the game screen "
+            "itself. Press Ctrl+C to stop."
+        )
     with FrameLoader(monitor_idx=args.monitor_idx, width=args.W, height=args.H) as frame_loader:
         try:
             while True:
@@ -385,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 if worker is not None:
                     worker.submit(captured)
-                    _, visualized = evaluate_with_latest_detections(
+                    candidates, visualized = evaluate_with_latest_detections(
                         captured_frame=captured,
                         latest_detection=worker.get_latest(),
                         object_associator=object_associator,
@@ -394,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
                         minion_color=args.minion_color,
                     )
                 else:
-                    _, visualized = process_frame(
+                    candidates, visualized = process_frame(
                         captured_frame=captured,
                         detector=detector,
                         object_associator=object_associator,
@@ -402,6 +452,27 @@ def main(argv: list[str] | None = None) -> int:
                         annotator=annotator,
                         minion_color=args.minion_color,
                     )
+
+                if not overlay_failed and overlay is None:
+                    try:
+                        overlay = DesktopOverlay(
+                            monitor=frame_loader.monitor,
+                            primary_width=frame_loader.primary_monitor["width"],
+                            marker_gap=args.overlay_gap,
+                        )
+                    except (OverlayUnavailable, ValueError) as exc:
+                        overlay_failed = True
+                        print(f"[WARNING] Desktop overlay disabled: {exc}")
+
+                if overlay is not None:
+                    overlay.render(candidates, captured.image.shape)
+                    if overlay.closed:
+                        overlay_failed = True
+                        overlay = None
+                        print(
+                            "[WARNING] Desktop overlay closed unexpectedly; "
+                            "markers are now only drawn in the preview window."
+                        )
 
                 if args.visualize and visualized is not None:
                     if not window_created:
@@ -417,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if worker is not None:
                 worker.stop()
+            if overlay is not None:
+                overlay.close()
             if window_created:
                 cv2.destroyAllWindows()
 

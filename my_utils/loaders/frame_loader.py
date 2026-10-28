@@ -80,6 +80,8 @@ class FrameLoader:
             self.sct.close()
             raise ValueError(f"monitor index {monitor_idx} is unavailable; use --list-monitors")
         self.monitor = dict(monitors[monitor_idx])
+        # monitors[0] is the union of every display; monitors[1] is the primary one.
+        self.primary_monitor = dict(monitors[1] if len(monitors) > 1 else monitors[0])
         self.width, self.height = width, height
 
     @staticmethod
