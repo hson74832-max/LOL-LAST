@@ -15,6 +15,7 @@ from my_utils.loaders.frame_loader import CapturedFrame, FrameLoader
 from my_utils.modules.algorithms import ObjectAssociator
 from my_utils.modules.detector import DEFAULT_WEIGHTS_PATH, Detector
 from my_utils.modules.last_hitter import LastHitAdvisor, LastHitCandidate, LastHitSettings
+from my_utils.modules.stability import CandidateGate
 from my_utils.visualizers.annotator import AIAnnotator
 from my_utils.visualizers.overlay import (
     DEFAULT_MARKER_GAP,
@@ -24,6 +25,12 @@ from my_utils.visualizers.overlay import (
 
 
 WINDOW_TITLE = "Last Hit Companion (Read-Only)"
+# Detections older than this are never drawn on a live frame: a stale bounding box
+# makes the companion point at minions that are already dead.
+DEFAULT_MAX_DETECTION_AGE = 0.35
+DEFAULT_CONFIRM_FRAMES = 2
+DEFAULT_BAR_MIN_CONFIDENCE = 0.20
+
 DEFAULT_MAX_HEALTH = {
     "caster": 300.0,
     "melee": 500.0,
@@ -239,7 +246,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--min_confidence",
         type=float,
         default=0.25,
-        help="Minimum detector confidence for minions and health bars.",
+        help=(
+            "Minimum detector confidence for minion bodies (default 0.25). "
+            "Raise it (0.4-0.5) to suppress phantom boxes."
+        ),
+    )
+    parser.add_argument(
+        "--min_bar_confidence",
+        type=float,
+        default=DEFAULT_BAR_MIN_CONFIDENCE,
+        help=(
+            "Minimum detector confidence for health bars (default 0.20; bars are "
+            "separate because low-HP bars score lower). Raise it (0.35-0.5) to reject "
+            "corpse flashes and spell-effect artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--max_detection_age",
+        type=_non_negative_float,
+        default=DEFAULT_MAX_DETECTION_AGE,
+        help=(
+            "Maximum age in seconds of the YOLO boxes reused on a live frame "
+            f"(default {DEFAULT_MAX_DETECTION_AGE}; 0 disables the limit). Lower it "
+            "(0.15-0.25) for stricter markers; raise it if your GPU/CPU cannot infer "
+            "that fast."
+        ),
+    )
+    parser.add_argument(
+        "--confirm_frames",
+        type=int,
+        default=DEFAULT_CONFIRM_FRAMES,
+        help=(
+            "Number of consecutive frames a candidate must be seen in before it is "
+            f"drawn (default {DEFAULT_CONFIRM_FRAMES}; 1 disables confirmation). "
+            "Higher values remove flicker and one-frame misreads but react slower."
+        ),
+    )
+    parser.add_argument(
+        "--stale_frame_fallback",
+        action="store_true",
+        help=(
+            "Legacy behaviour: when the live frame yields no match, re-run detection on "
+            "the previous frame. Off by default because it shows dead/outdated minions."
+        ),
     )
     parser.add_argument(
         "--player_anchor",
@@ -265,7 +314,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--device",
         type=str,
         default=None,
-        help="Inference device (e.g. cpu, cuda:0, mps). Auto-detected if omitted.",
+        help=(
+            "Inference device: cpu, cuda:0 (NVIDIA), mps (Apple), directml (AMD/Intel GPU "
+            "on Windows, needs torch-directml). Auto-detected if omitted."
+        ),
     )
     return parser
 
@@ -277,6 +329,7 @@ def process_frame(
     advisor: LastHitAdvisor,
     annotator: AIAnnotator | None = None,
     minion_color: str = "red",
+    gate: CandidateGate | None = None,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
     """Evaluate a single frame and return (prioritized_last_hit_candidates, visualized_frame)."""
     detection_result = detector(captured_frame.image)
@@ -287,12 +340,29 @@ def process_frame(
         excluded_regions=captured_frame.excluded_regions,
     )
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    if gate is not None:
+        candidates = gate.update(
+            candidates, captured_frame.image.shape, generation=captured_frame
+        )
     visualized = (
         annotator(candidates=candidates, img=captured_frame.image)
         if annotator is not None
         else None
     )
     return candidates, visualized
+
+
+def detection_age(
+    captured_frame: CapturedFrame,
+    latest_detection: tuple[CapturedFrame, dict] | None,
+) -> float | None:
+    """Age in seconds of the detector boxes relative to the live frame, if any."""
+    if latest_detection is None:
+        return None
+    det_frame = latest_detection[0]
+    if det_frame is captured_frame:
+        return 0.0
+    return max(0.0, captured_frame.captured_at - det_frame.captured_at)
 
 
 def evaluate_with_latest_detections(
@@ -302,15 +372,33 @@ def evaluate_with_latest_detections(
     advisor: LastHitAdvisor,
     annotator: AIAnnotator | None = None,
     minion_color: str = "red",
+    gate: CandidateGate | None = None,
+    max_detection_age: float | None = DEFAULT_MAX_DETECTION_AGE,
+    allow_stale_frame_fallback: bool = False,
 ) -> tuple[list[LastHitCandidate], np.ndarray | None]:
-    """Re-evaluate health bars on the live frame using the newest detector boxes."""
-    if latest_detection is None:
+    """Re-evaluate health bars on the live frame using the newest detector boxes.
+
+    Boxes older than ``max_detection_age`` are discarded instead of being projected
+    onto the live frame: a delayed box is how the companion ends up highlighting a
+    minion that died, or another minion entirely, while the camera scrolls.
+    """
+    def _empty():
         visualized = (
             annotator(candidates=[], img=captured_frame.image, copy=False)
             if annotator is not None
             else None
         )
+        if gate is not None:
+            gate.reset()
         return [], visualized
+
+    if latest_detection is None:
+        return _empty()
+
+    age = detection_age(captured_frame, latest_detection)
+    # 0 (or None) disables the age limit, e.g. for very slow CPU-only machines.
+    if max_detection_age and age is not None and age > max_detection_age:
+        return _empty()
 
     det_frame, detection_result = latest_detection
     matched_minions = object_associator(
@@ -319,11 +407,9 @@ def evaluate_with_latest_detections(
         minion_type=minion_color,
         excluded_regions=captured_frame.excluded_regions,
     )
-    if (
-        not matched_minions
-        and det_frame is not captured_frame
-        and (captured_frame.captured_at - det_frame.captured_at) <= 0.6
-    ):
+    # Opt-in only: re-running association on an old frame re-creates the exact stale
+    # markers this companion is meant to avoid (dead minions, outdated health).
+    if not matched_minions and allow_stale_frame_fallback and det_frame is not captured_frame:
         matched_minions = object_associator(
             detection_result,
             img=det_frame.image,
@@ -332,6 +418,11 @@ def evaluate_with_latest_detections(
         )
 
     candidates = advisor.rank(matched_minions, captured_frame.image.shape)
+    if gate is not None:
+        # Sightings are counted per detector result, not per capture frame.
+        candidates = gate.update(
+            candidates, captured_frame.image.shape, generation=det_frame
+        )
     # The live frame was just handed to the detection worker; annotating it in
     # place would let YOLOv9 read half-drawn boxes, so always render on a copy.
     visualized = (
@@ -378,6 +469,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{idx}] {monitor}")
         return 0
 
+    if args.confirm_frames < 1:
+        parser.error("--confirm_frames must be at least 1")
+    if not 0 < args.min_bar_confidence <= 1:
+        parser.error("--min_bar_confidence must be greater than 0 and at most 1")
+
     settings = LastHitSettings(
         effective_damage=args.effective_damage,
         max_health={
@@ -396,8 +492,17 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         imgsz=(args.imgsz, args.imgsz),
     )
-    object_associator = ObjectAssociator(min_confidence=args.min_confidence)
+    object_associator = ObjectAssociator(
+        min_confidence=args.min_confidence,
+        bar_min_confidence=args.min_bar_confidence,
+    )
     advisor = LastHitAdvisor(settings)
+    gate = CandidateGate(confirm_frames=args.confirm_frames)
+    print(
+        f"[INFO] Markers require {args.confirm_frames} consecutive frame(s); detector boxes "
+        f"older than {args.max_detection_age * 1000:.0f} ms are ignored; "
+        f"min body/bar confidence {args.min_confidence:.2f}/{args.min_bar_confidence:.2f}."
+    )
     annotator = AIAnnotator() if args.visualize else None
 
     worker = None if args.sync else _AsyncDetectionWorker(detector)
@@ -406,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
 
     window_created = False
     warned_black_frame = False
+    warned_stale_detections = False
     overlay: DesktopOverlay | None = None
     overlay_failed = not args.overlay
     if args.overlay:
@@ -435,13 +541,32 @@ def main(argv: list[str] | None = None) -> int:
 
                 if worker is not None:
                     worker.submit(captured)
+                    latest = worker.get_latest()
+                    age = detection_age(captured, latest)
+                    if (
+                        age is not None
+                        and args.max_detection_age
+                        and age > args.max_detection_age
+                        and not warned_stale_detections
+                    ):
+                        print(
+                            f"[WARNING] Detector boxes are {age * 1000:.0f} ms old, which is "
+                            f"above --max_detection_age {args.max_detection_age * 1000:.0f} ms, "
+                            "so markers are suppressed instead of being drawn on stale boxes. "
+                            "Speed up inference (GPU: run.bat, AMD/Intel: "
+                            "install_requirements.bat --directml) or raise --max_detection_age."
+                        )
+                        warned_stale_detections = True
                     candidates, visualized = evaluate_with_latest_detections(
                         captured_frame=captured,
-                        latest_detection=worker.get_latest(),
+                        latest_detection=latest,
                         object_associator=object_associator,
                         advisor=advisor,
                         annotator=annotator,
                         minion_color=args.minion_color,
+                        gate=gate,
+                        max_detection_age=args.max_detection_age,
+                        allow_stale_frame_fallback=args.stale_frame_fallback,
                     )
                 else:
                     candidates, visualized = process_frame(
@@ -451,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
                         advisor=advisor,
                         annotator=annotator,
                         minion_color=args.minion_color,
+                        gate=gate,
                     )
 
                 if not overlay_failed and overlay is None:

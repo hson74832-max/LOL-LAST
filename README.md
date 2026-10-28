@@ -18,6 +18,43 @@ This repository provides a **read-only, non-injection** visual companion for ide
 
 Overlay markers are small triangles drawn above each minion's head (`--overlay_gap`, default 16 px) so they never cover a health bar and never corrupt the next frame's health reading. Like screen capture, the overlay requires the game to run in **Borderless** or **Windowed** mode; Exclusive Fullscreen hides any external window.
 
+## GPU Support (NVIDIA / AMD / Intel / Apple)
+The detector runs on whatever backend is available; it never silently requires CUDA:
+
+| Hardware | Backend | Install |
+| --- | --- | --- |
+| NVIDIA | CUDA (`cuda:0`, fp16) | `install_requirements.bat` (auto-detects `nvidia-smi`) |
+| AMD / Intel on Windows | DirectML (`--device directml`) | `install_requirements.bat --directml` |
+| Apple Silicon | MPS | default on macOS |
+| Nothing usable | CPU | default fallback |
+
+- DirectML is picked **automatically** when `torch-directml` is installed; force it with `--device directml`. It is Windows-only (on Linux use ROCm PyTorch).
+- DirectML runs in fp32 (no fp16 support) and is slower than CUDA, but much faster than CPU.
+- If the detector starts on CPU, `main.py` prints the exact commands to enable GPU inference — CPU inference is also the most common reason markers lag behind the game.
+
+Check the first lines of console output, they state the device explicitly, e.g.:
+```
+[INFO] Detector initialized on device=privateuseone:0 [DirectML] (fp16=False, imgsz=(640, 640))
+```
+
+## Marker Strictness (no markers on dead minions)
+Confusing or delayed markers come from two places: **stale detections** (boxes from an older frame are projected onto the live frame) and **one-frame misreads** (a body/bar box for a minion that just died). Both are now throttled:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--max_detection_age` | `0.35` s | Detector boxes older than this are **discarded** instead of being drawn on the live frame. Lower (`0.15`–`0.25`) = stricter/snappier; raise it if your machine cannot infer that fast; `0` disables the limit. |
+| `--confirm_frames` | `2` | A candidate must be seen in that many **consecutive detector results** before it is drawn. Higher (3) = fewer flickers and no phantom markers, but slower to appear. `1` disables confirmation. |
+| `--min_bar_confidence` | `0.20` | Minimum confidence for health bars (separate from bodies because low-HP bars score lower). Raise to `0.35`–`0.5` to reject corpse flashes and spell-effect artifacts. |
+| `--min_confidence` | `0.25` | Minimum confidence for minion bodies. Raise to `0.4`–`0.5` to suppress phantom boxes. |
+| `--stale_frame_fallback` | off | Legacy behaviour: when the live frame yields no match, re-run association on the previous frame. Off because that is exactly what produces delayed markers on dead minions. |
+
+A marker disappears on the **first** frame a candidate is no longer detected — there is no hold time and no memory of dead minions. When detections are older than `--max_detection_age`, the companion prints a one-time warning naming the fix (GPU install or a larger age limit) instead of showing wrong markers.
+
+Strictest useful setup on a mid-range GPU:
+```bat
+run.bat --monitor_idx 1 --device directml --confirm_frames 3 --max_detection_age 0.2 --min_bar_confidence 0.35
+```
+
 ## Installation
 
 ### Windows (Batch File)
@@ -73,6 +110,11 @@ python main.py --list-monitors
 - `--effective_damage`: Conservative lower bound on post-mitigation basic-attack damage.
 - `--caster_max_hp`, `--melee_max_hp`, `--siege_max_hp`: Conservative upper bounds on minion maximum HP.
 - `--health_margin`: Additional fractional safety margin added to measured health bar fraction (default `0.0`).
-- `--min_confidence`: Minimum detection confidence for minions and health bars (default `0.25`).
+- `--min_confidence`: Minimum detection confidence for minion bodies (default `0.25`).
+- `--min_bar_confidence`: Minimum detection confidence for health bars (default `0.20`).
+- `--max_detection_age`: Maximum age in seconds of detector boxes reused on a live frame (default `0.35`, `0` disables).
+- `--confirm_frames`: Consecutive detector results a candidate must be seen in before it is drawn (default `2`).
+- `--stale_frame_fallback`: Re-enable the legacy previous-frame fallback (off by default).
 - `--player_anchor`: Normalized `(x, y)` anchor in `[0, 1]` for distance prioritization (default `0.5 0.5`).
 - `--max_distance`: Optional maximum pixel distance from the player anchor.
+- `--device`: `cpu`, `cuda:0` (NVIDIA), `mps` (Apple) or `directml` (AMD/Intel on Windows). Auto-detected when omitted.

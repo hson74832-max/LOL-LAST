@@ -37,13 +37,66 @@ KNOWN_LABELS = (
 )
 
 
+DIRECTML_ALIASES = frozenset({"directml", "dml", "privateuseone", "privateuseone:0"})
+
+
+def is_directml_request(device) -> bool:
+    """True when ``device`` asks for DirectML (the AMD/Intel GPU backend on Windows)."""
+    return str(device).strip().lower() in DIRECTML_ALIASES
+
+
+def directml_available() -> bool:
+    """True when torch-directml is installed and reports a usable device."""
+    try:
+        import torch_directml  # type: ignore[import-not-found]
+    except Exception:
+        return False
+    try:
+        return bool(torch_directml.is_available())
+    except Exception:
+        return False
+
+
+def directml_device():
+    """Return the torch-directml device object, with actionable install hints on failure."""
+    try:
+        import torch_directml  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError(
+            "DirectML was requested but torch-directml is not installed.\n"
+            "  Windows (AMD/Intel GPUs): pip install torch-directml\n"
+            "  or re-run: install_requirements.bat --directml\n"
+            "  Linux (AMD GPUs): install ROCm-enabled PyTorch from https://pytorch.org instead."
+        ) from exc
+    try:
+        is_available = getattr(torch_directml, "is_available", None)
+        if callable(is_available) and not is_available():
+            raise RuntimeError("torch-directml is installed but reports no usable DirectML device")
+    except AttributeError:
+        pass
+    return torch_directml.device()
+
+
 def select_default_device(torch_module) -> str:
+    """Pick the fastest available backend: CUDA -> Apple MPS -> DirectML (AMD/Intel) -> CPU."""
     if torch_module.cuda.is_available():
         return "cuda:0"
     mps_backend = getattr(torch_module.backends, "mps", None)
     if mps_backend is not None and mps_backend.is_available():
         return "mps"
+    if directml_available():
+        return "directml"
     return "cpu"
+
+
+CPU_DEVICE_HINT = (
+    "[NOTE] Running on CPU. This is the usual cause of markers that lag behind or stay "
+    "on minions that are already dead.\n"
+    "       NVIDIA GPU : re-run run.bat / install_requirements.bat to get CUDA PyTorch\n"
+    "       AMD/Intel  : install_requirements.bat --directml   (pip install torch-directml)\n"
+    "       AMD Linux  : install ROCm PyTorch from https://pytorch.org\n"
+    "       Otherwise  : lower --imgsz (e.g. --imgsz 480) and/or --H/--W to cut inference time."
+)
 
 
 def _is_valid_checkpoint_file(path: Path) -> bool:
@@ -315,6 +368,8 @@ class Detector:
         self.conf_thres = float(conf_thres)
         self.iou_thres = float(iou_thres)
 
+        self.directml = False
+        self.device_name = "backend"
         if backend is not None:
             self.model = backend
             self._letterbox = None
@@ -327,34 +382,65 @@ class Detector:
             resolved_weight_path = resolve_weight_path(
                 weight_path, auto_download=auto_download
             )
-            resolved_device_str = device or select_default_device(torch)
-            resolved_device = torch.device(resolved_device_str)
-            use_half = (resolved_device.type == "cuda") if half is None else bool(half)
-            if resolved_device.type == "cuda" and hasattr(torch.backends, "cudnn"):
+            requested_device = str(device) if device else select_default_device(torch)
+            self.directml = is_directml_request(requested_device)
+            if self.directml:
+                # torch-directml exposes a "privateuseone" torch device, but YOLOv9's
+                # DetectMultiBackend only validates CUDA device strings, so the model is
+                # built on CPU and then moved onto the DirectML device explicitly.
+                resolved_device = directml_device()
+                build_device = torch.device("cpu")
+                use_half = False
+                if half:
+                    print(
+                        "[NOTE] fp16 is not supported by DirectML; continuing with fp32. "
+                        "Pass --device cuda:0 to use fp16 on an NVIDIA GPU."
+                    )
+            else:
+                resolved_device = torch.device(requested_device)
+                build_device = resolved_device
+                use_half = (resolved_device.type == "cuda") if half is None else bool(half)
+            if build_device.type == "cuda" and hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.benchmark = True
 
             DetectMultiBackend, letterbox, non_max_suppression, scale_boxes = _load_yolov9_symbols()
             with _torch_load_compat(torch):
                 self.model = DetectMultiBackend(
                     str(resolved_weight_path),
-                    device=resolved_device,
+                    device=build_device,
                     dnn=dnn,
                     fp16=use_half,
                 )
-            if hasattr(self.model, "warmup") and resolved_device.type == "cuda":
+            if self.directml:
+                try:
+                    getattr(self.model, "model", self.model).to(resolved_device)
+                    self.model.device = resolved_device
+                    self.model.fp16 = False
+                except Exception as exc:
+                    print(
+                        f"[WARNING] DirectML initialisation failed ({exc}); "
+                        "falling back to CPU inference."
+                    )
+                    self.directml = False
+                    resolved_device = torch.device("cpu")
+            elif hasattr(self.model, "warmup") and resolved_device.type == "cuda":
                 try:
                     self.model.warmup(imgsz=(1, 3, *self.imgsz))
                 except Exception:
                     pass
+            self.device_name = str(resolved_device)
+            backend_label = "DirectML" if self.directml else resolved_device.type.upper()
             print(
-                f"[INFO] Detector initialized on device={resolved_device} "
+                f"[INFO] Detector initialized on device={resolved_device} [{backend_label}] "
                 f"(fp16={getattr(self.model, 'fp16', use_half)}, imgsz={self.imgsz})"
             )
-            if resolved_device.type == "cpu":
+            if self.directml:
                 print(
-                    "[NOTE] Running on CPU. If you have an NVIDIA GPU on Windows, "
-                    "re-run run.bat or install_requirements.bat to enable CUDA acceleration."
+                    "[NOTE] AMD/Intel GPU acceleration via torch-directml is active. "
+                    "DirectML is slower than CUDA but far faster than CPU inference."
                 )
+            elif resolved_device.type == "cpu":
+                print(CPU_DEVICE_HINT)
             self._letterbox = letterbox
             self._nms = non_max_suppression
             self._scale_boxes = scale_boxes
@@ -401,6 +487,10 @@ class Detector:
 
             raw_pred = self.model(tensor, augment=False, visualize=False)
             pred = _unwrap_predictions(raw_pred)
+            if self.directml and hasattr(pred, "cpu"):
+                # torchvision NMS and the post-processing below are not implemented for
+                # the "privateuseone" backend, so the (tiny) prediction tensor moves to CPU.
+                pred = pred.cpu()
             pred = self._nms(pred, conf_thres=self.conf_thres, iou_thres=self.iou_thres)
 
         return self._classify_detections(pred, tensor.shape[2:], img.shape)

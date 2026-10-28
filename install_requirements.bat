@@ -5,11 +5,14 @@ cd /d "%~dp0"
 
 set "USE_SYSTEM=0"
 set "NO_PAUSE=0"
+set "USE_DIRECTML=0"
 
 :parse_args
 if "%~1"=="" goto :args_done
 if /I "%~1"=="--system" set "USE_SYSTEM=1"
 if /I "%~1"=="--no-pause" set "NO_PAUSE=1"
+if /I "%~1"=="--directml" set "USE_DIRECTML=1"
+if /I "%~1"=="--amd" set "USE_DIRECTML=1"
 shift
 goto :parse_args
 :args_done
@@ -84,6 +87,28 @@ if not errorlevel 1 (
     )
 )
 
+if "%USE_DIRECTML%"=="1" (
+    echo [INFO] Installing DirectML PyTorch for AMD/Intel GPU inference...
+    %TARGET_PYTHON% -m pip install --upgrade torch-directml
+    if errorlevel 1 (
+        echo [WARNING] torch-directml could not be installed. The companion will run on CPU.
+    ) else (
+        %TARGET_PYTHON% -c "import torch_directml; raise SystemExit(0 if torch_directml.is_available() else 1)"
+        if errorlevel 1 (
+            echo [WARNING] torch-directml is installed but no DirectML device was found.
+        ) else (
+            echo [INFO] DirectML GPU acceleration is ready.
+        )
+    )
+) else (
+    where nvidia-smi >nul 2>nul
+    if errorlevel 1 (
+        echo [HINT] No NVIDIA GPU detected. On an AMD or Intel GPU, re-run:
+        echo            install_requirements.bat --directml
+        echo        to install DirectML PyTorch and speed inference up considerably.
+    )
+)
+
 if not exist "yolov9\models\common.py" (
     echo [INFO] Setting up YOLOv9 repository in .\yolov9 ...
     where git >nul 2>nul
@@ -121,6 +146,10 @@ echo           To start the companion, run:
 echo               run.bat
 echo           or:
 echo               %TARGET_PYTHON% main.py --monitor_idx 1 --visualize True --minion_color red
+if "%USE_DIRECTML%"=="1" (
+    echo           DirectML build is installed; main.py picks it up automatically
+    echo           ^(or force it with --device directml^).
+)
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 
