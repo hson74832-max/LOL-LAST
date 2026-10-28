@@ -449,4 +449,15 @@ def test_weight_resolution_and_windows_torch_compat(tmp_path, monkeypatch):
 
     # 4. Single-dash -effective_damage 77 works in CLI
     parser = build_arg_parser()
-    assert parser.parse_args(["-effective_damage", "77"]).effective_damage == 77.0
+    parsed = parser.parse_args(["-effective_damage", "77", "--H", "1440", "--W", "2560"])
+    assert parsed.effective_damage == 77.0
+    assert parsed.mask_preview is False
+    assert parsed.H == 1440 and parsed.W == 2560
+
+    # 5. High-resolution (2x upscaled for 2560x1440) health bar still matches via multi-scale fallback
+    utils = HealthBarUtils()
+    base_bar = make_synthetic_health_bar(width=60, height=8, fill_px=12, color="red")
+    upscaled_bar = cv2.resize(base_bar, (120, 16), interpolation=cv2.INTER_LINEAR)
+    upscaled_level = utils.get_health_level(upscaled_bar, bar_color="red")
+    assert upscaled_level is not None
+    assert 0.15 < upscaled_level < 0.35
